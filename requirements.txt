@@ -1,0 +1,22 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+
+# Environment
+gymnasium>=0.29.0
+# or: gym>=0.26.0
+
+# Optional: FAISS for scalable LTM
+# faiss-cpu>=1.7.4
+# or: faiss-gpu>=1.7.4
+
+# Optional: Mamba SSM (vendored in vendor/mamba_ssm)
+# mamba-ssm>=1.0.0
+
+# Testing
+pytest>=7.0.0
+
+# Development
+# black
+# flake8
+# mypy

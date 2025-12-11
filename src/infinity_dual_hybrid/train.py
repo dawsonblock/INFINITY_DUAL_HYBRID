@@ -1,0 +1,306 @@
+"""
+train.py
+
+CLI entry point for training Infinity V3 Dual Hybrid Agent.
+
+Usage:
+    python -m infinity_v3_dual_hybrid.train --env CartPole-v1 --iterations 50
+    python -m infinity_v3_dual_hybrid.train --config config.yaml
+
+This script:
+1. Loads configuration
+2. Creates environments
+3. Builds the agent
+4. Trains with PPO
+5. Saves checkpoints and logs progress
+"""
+
+import argparse
+import os
+import time
+from typing import Optional
+
+import torch
+import numpy as np
+
+from .config import TrainConfig, get_config_for_env
+from .agent import InfinityV3DualHybridAgent
+from .ppo_trainer import PPOTrainer
+from .envs import make_envs, get_env_info
+
+
+def set_seed(seed: Optional[int]) -> None:
+    """Set random seeds for reproducibility."""
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
+    """
+    Main training loop.
+
+    Args:
+        cfg: Training configuration
+    Returns:
+        Trained agent
+    """
+    print("=" * 60)
+    print("Infinity V3 Dual Hybrid Training")
+    print("=" * 60)
+    print(f"Environment: {cfg.env_id}")
+    print(f"Device: {cfg.device}")
+    print(f"Iterations: {cfg.ppo.max_iterations}")
+    print("=" * 60)
+
+    # Set seed
+    set_seed(cfg.seed)
+
+    # Get environment info and update config
+    env_info = get_env_info(cfg.env_id)
+    cfg.agent.obs_dim = env_info["obs_dim"]
+    cfg.agent.act_dim = env_info["act_dim"]
+
+    print(f"Observation dim: {cfg.agent.obs_dim}")
+    print(f"Action dim: {cfg.agent.act_dim}")
+    print("=" * 60)
+
+    # Create environments
+    envs = make_envs(cfg.env_id, cfg.ppo.num_envs)
+
+    # Create agent
+    agent = InfinityV3DualHybridAgent(cfg.agent).to(cfg.device)
+
+    # Count parameters
+    num_params = sum(p.numel() for p in agent.parameters())
+    print(f"Model parameters: {num_params:,}")
+
+    # Create trainer
+    trainer = PPOTrainer(agent, cfg.ppo, device=cfg.device)
+
+    # Create save directory
+    if cfg.save_path:
+        os.makedirs(cfg.save_path, exist_ok=True)
+
+    # Training loop
+    start_time = time.time()
+    best_eval_reward = float("-inf")
+
+    for iteration in range(1, cfg.ppo.max_iterations + 1):
+        iter_start = time.time()
+
+        # Collect rollouts
+        rollouts = trainer.collect_rollouts(envs)
+
+        # Train
+        train_stats = trainer.train_step(rollouts)
+
+        # Evaluate
+        eval_stats = {}
+        if iteration % cfg.ppo.eval_interval == 0:
+            eval_stats = trainer.evaluate(envs, num_episodes=cfg.ppo.eval_episodes)
+
+            # Track best
+            if eval_stats["eval_mean_reward"] > best_eval_reward:
+                best_eval_reward = eval_stats["eval_mean_reward"]
+                if cfg.save_path:
+                    trainer.save(os.path.join(cfg.save_path, "best_model.pt"))
+
+        # Log
+        if iteration % cfg.log_interval == 0:
+            iter_time = time.time() - iter_start
+
+            log_str = (
+                f"[Iter {iteration:4d}/{cfg.ppo.max_iterations}] "
+                f"policy_loss={train_stats['policy_loss']:.4f} "
+                f"value_loss={train_stats['value_loss']:.4f} "
+                f"entropy={train_stats['entropy']:.4f} "
+                f"mean_rew={train_stats['mean_reward']:.2f}"
+            )
+            if eval_stats:
+                log_str += f" | eval={eval_stats['eval_mean_reward']:.2f}"
+            log_str += f" | time={iter_time:.2f}s"
+
+            print(log_str)
+
+        # Save checkpoint
+        if cfg.save_path and iteration % cfg.save_interval == 0:
+            trainer.save(os.path.join(cfg.save_path, f"checkpoint_{iteration}.pt"))
+
+    # Final save
+    if cfg.save_path:
+        trainer.save(os.path.join(cfg.save_path, "final_model.pt"))
+
+    # Cleanup
+    for env in envs:
+        env.close()
+    agent.shutdown()
+
+    total_time = time.time() - start_time
+    print("=" * 60)
+    print(f"Training complete in {total_time:.2f}s")
+    print(f"Best eval reward: {best_eval_reward:.2f}")
+    print("=" * 60)
+
+    return agent
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train Infinity V3 Dual Hybrid Agent"
+    )
+
+    # Environment
+    parser.add_argument(
+        "--env", type=str, default="CartPole-v1",
+        help="Gym environment ID"
+    )
+
+    # Training
+    parser.add_argument(
+        "--iterations", type=int, default=50,
+        help="Number of training iterations"
+    )
+    parser.add_argument(
+        "--steps-per-rollout", type=int, default=2048,
+        help="Steps per rollout"
+    )
+    parser.add_argument(
+        "--num-envs", type=int, default=1,
+        help="Number of parallel environments"
+    )
+
+    # Model
+    parser.add_argument(
+        "--hidden-dim", type=int, default=128,
+        help="Hidden dimension"
+    )
+    parser.add_argument(
+        "--use-mamba", action="store_true", default=False,
+        help="Use Mamba backbone (requires mamba-ssm)"
+    )
+    parser.add_argument(
+        "--use-ltm", action="store_true", default=False,
+        help="Use LTM (episodic memory)"
+    )
+    parser.add_argument(
+        "--use-faiss", action="store_true", default=False,
+        help="Use FAISS for LTM (requires faiss-cpu)"
+    )
+
+    # Optimization
+    parser.add_argument(
+        "--lr", type=float, default=3e-4,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64,
+        help="Mini-batch size"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=10,
+        help="PPO epochs per iteration"
+    )
+
+    # Other
+    parser.add_argument(
+        "--device", type=str, default="auto",
+        help="Device (auto, cuda, cpu)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed"
+    )
+    parser.add_argument(
+        "--save-path", type=str, default="checkpoints",
+        help="Save directory"
+    )
+    parser.add_argument(
+        "--eval-interval", type=int, default=1,
+        help="Evaluation interval"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    # Build config from args
+    cfg = get_config_for_env(args.env)
+    cfg.env_id = args.env
+    cfg.device = args.device if args.device != "auto" else (
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    cfg.seed = args.seed
+    cfg.save_path = args.save_path
+
+    # PPO config
+    cfg.ppo.max_iterations = args.iterations
+    cfg.ppo.steps_per_rollout = args.steps_per_rollout
+    cfg.ppo.num_envs = args.num_envs
+    cfg.ppo.learning_rate = args.lr
+    cfg.ppo.batch_size = args.batch_size
+    cfg.ppo.train_epochs = args.epochs
+    cfg.ppo.eval_interval = args.eval_interval
+
+    # Agent config
+    cfg.agent.hidden_dim = args.hidden_dim
+    cfg.agent.backbone.use_mamba = args.use_mamba
+    cfg.agent.use_ltm_in_forward = args.use_ltm
+    cfg.agent.ltm.use_faiss = args.use_faiss
+    cfg.agent.sync_dims()  # Sync dimensions after modifications
+
+    # Train
+    train(cfg)
+
+
+def quick_test():
+    """Quick sanity test - one forward pass and optimization step."""
+    print("Running quick sanity test...")
+
+    # Minimal config
+    cfg = TrainConfig()
+    cfg.env_id = "CartPole-v1"
+    cfg.agent.obs_dim = 4
+    cfg.agent.act_dim = 2
+    cfg.agent.hidden_dim = 64
+    cfg.agent.backbone.use_mamba = False
+    cfg.agent.backbone.use_attention = False  # Pure MLP for test
+    cfg.agent.use_ltm_in_forward = False
+    cfg.agent.use_miras_in_forward = True
+    cfg.agent.sync_dims()  # Sync after changing hidden_dim
+    cfg.device = "cpu"
+
+    # Create agent
+    agent = InfinityV3DualHybridAgent(cfg.agent)
+    print(f"Agent created with {sum(p.numel() for p in agent.parameters()):,} params")
+
+    # Dummy forward pass
+    obs = torch.randn(4, 4)  # [B=4, obs_dim=4]
+    out = agent(obs)
+    print(f"Forward pass: logits={out['logits'].shape}, value={out['value'].shape}")
+
+    # Dummy optimization step
+    optimizer = torch.optim.Adam(agent.parameters(), lr=1e-3)
+    loss = out["logits"].mean() + out["value"].mean()
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    print(f"Optimization step completed, loss={loss.item():.4f}")
+
+    print("Sanity test PASSED!")
+    return True
+
+
+if __name__ == "__main__":
+    import sys
+    if "--test" in sys.argv:
+        quick_test()
+    else:
+        main()
