@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "infinity-dual-hybrid"
-version = "1.0.0"
-description = "Lean RL architecture with Mamba2, Dual-Tier Miras, and FAISS LTM"
+version = "2.0.0"
+description = "Production-grade RL framework with Mamba2, Dual-Tier Miras, FAISS LTM, and unified logging"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -40,6 +40,19 @@ dev = [
 faiss = [
     "faiss-cpu>=1.7.4",
 ]
+mamba = [
+    "mamba-ssm>=1.0.0",
+]
+tensorboard = [
+    "tensorboard>=2.10.0",
+]
+all = [
+    "faiss-cpu>=1.7.4",
+    "tensorboard>=2.10.0",
+]
+
+[project.scripts]
+infinity-train = "infinity_dual_hybrid.train:main"
 
 [project.urls]
 Homepage = "https://github.com/dawsonblock/INFINITY_DUAL_HYBRID"

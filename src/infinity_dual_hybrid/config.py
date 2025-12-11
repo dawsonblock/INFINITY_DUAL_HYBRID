@@ -34,6 +34,12 @@ class MirasConfig:
     init_fast_weight: float = 0.7  # Initial blend: 70% fast, 30% deep
     context_gate: bool = True       # Use context-dependent gating
 
+    # v2.0: Stability upgrades
+    grad_clip: float = 1.0          # Per-tier gradient clipping
+    norm_reg: float = 0.0           # Norm regularization coefficient
+    use_ema: bool = False           # EMA smoothing of updates
+    ema_decay: float = 0.99         # EMA decay rate
+
 
 @dataclass
 class LTMConfig:
@@ -83,6 +89,12 @@ class BackboneConfig:
     # Hybrid order: 'mamba_first' or 'attention_first'
     hybrid_order: str = 'mamba_first'
 
+    # v2.0: Backbone upgrades
+    use_residual: bool = True         # Residual connections
+    use_drop_path: bool = False       # Stochastic depth
+    drop_path_rate: float = 0.1       # Drop path probability
+    pre_norm: bool = True             # Pre-LayerNorm vs Post-LayerNorm
+
 
 @dataclass
 class AgentConfig:
@@ -106,7 +118,11 @@ class AgentConfig:
 
     # State management
     reset_mamba_state_on_episode: bool = True
-    reset_miras_on_episode: bool = False  # Miras persists across episodes by default
+    reset_miras_on_episode: bool = False
+
+    # v2.0: Agent mode and diagnostics
+    mode: str = "train"  # "train", "eval", "inference"
+    temperature: float = 1.0  # Policy temperature for discrete actions
 
     def __post_init__(self):
         self.sync_dims()
@@ -154,6 +170,14 @@ class PPOConfig:
     # Evaluation
     eval_episodes: int = 5
     eval_interval: int = 1
+
+    # v2.0: PPO upgrades
+    normalize_gae: bool = True        # Normalize advantages
+    adaptive_kl: bool = False         # Adaptive KL target tuning
+    kl_adapt_coef: float = 1.5        # KL adaptation multiplier
+    grad_explosion_threshold: float = 100.0  # Grad norm threshold
+    lr_reduce_factor: float = 0.5     # LR reduction on explosion
+    track_grad_norm: bool = True      # Log gradient norms
 
 
 @dataclass

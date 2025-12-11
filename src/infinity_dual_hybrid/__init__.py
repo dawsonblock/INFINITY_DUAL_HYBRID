@@ -1,14 +1,15 @@
 """
-Infinity Dual Hybrid - Lean Build
+Infinity Dual Hybrid v2.0
 
-A production-grade RL architecture combining:
-- Hybrid SSM/Attention backbone (Mamba2 + Transformer)
-- Dual-Tier Miras parametric memory
-- FAISS IVF-PQ episodic LTM
-- PPO trainer with GAE
+A production-grade, research-ready RL framework combining:
+- Hybrid SSM/Attention backbone (Mamba2 + Transformer) with residual + DropPath
+- Dual-Tier Miras parametric memory with gradient clipping + EMA
+- FAISS IVF-PQ episodic LTM with automatic commit engine
+- PPO trainer with adaptive KL, GAE normalization, gradient protection
+- Unified logging (CSV, JSONL, TensorBoard)
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 from .config import (
     TrainConfig,
@@ -30,11 +31,15 @@ from .miras import (
     SSMCompressedMirasTitans,
 )
 
-from .ltm import build_ltm, SimpleLTM
+from .ltm import build_ltm, SimpleLTM, LTMWrapper
 
 from .ssm_backbone import HybridSSMAttentionBackbone, ObservationEncoder
 
 from .envs import make_envs, make_env, get_env_info
+
+from .commit_engine import LTMCommitEngine, CommitConfig, CommitMode
+
+from .logger import UnifiedLogger, LoggerConfig, create_logger
 
 
 def build_agent(cfg: AgentConfig) -> InfinityV3DualHybridAgent:
@@ -68,6 +73,7 @@ __all__ = [
     "SSMCompressedMirasTitans",
     "build_ltm",
     "SimpleLTM",
+    "LTMWrapper",
     # Backbone
     "HybridSSMAttentionBackbone",
     "ObservationEncoder",
@@ -75,4 +81,12 @@ __all__ = [
     "make_envs",
     "make_env",
     "get_env_info",
+    # v2.0: Commit Engine
+    "LTMCommitEngine",
+    "CommitConfig",
+    "CommitMode",
+    # v2.0: Logger
+    "UnifiedLogger",
+    "LoggerConfig",
+    "create_logger",
 ]
