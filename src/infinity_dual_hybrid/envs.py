@@ -9,7 +9,7 @@ Provides:
 - Multi-environment support
 """
 
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Optional, Dict
 import numpy as np
 
 try:
@@ -22,6 +22,72 @@ except ImportError:
     except ImportError:
         gym = None
         HAS_GYM = False
+
+
+if HAS_GYM:
+
+    class DelayedCueEnv(gym.Env):
+        def __init__(
+            self,
+            delay: int = 1000,
+            noise_dim: int = 4,
+            regime_shift: bool = False,
+        ):
+            super().__init__()
+            self.delay = int(delay)
+            self.noise_dim = int(noise_dim)
+            self.regime_shift = bool(regime_shift)
+
+            self.observation_space = gym.spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(self.noise_dim + 1,),
+                dtype=np.float32,
+            )
+            self.action_space = gym.spaces.Discrete(2)
+
+            self.t = 0
+            self.cue_time = 0
+            self.cue = 0
+
+        def reset(
+            self,
+            *,
+            seed: Optional[int] = None,
+            options: Optional[Dict[str, Any]] = None,
+        ):
+            _ = options
+            super().reset(seed=seed)
+            if self.regime_shift:
+                self.delay = int(np.random.choice([200, 500, 1000, 2000]))
+            self.t = 0
+            self.cue_time = int(np.random.randint(10, 50))
+            self.cue = int(np.random.randint(0, 2))
+            return self._obs(), {}
+
+        def _obs(self) -> np.ndarray:
+            cue_value = float(self.cue) if self.t == self.cue_time else 0.0
+            noise = np.random.randn(self.noise_dim).astype(np.float32) * 0.1
+            obs = np.concatenate(
+                [noise, np.array([cue_value], dtype=np.float32)]
+            )
+            return obs.astype(np.float32)
+
+        def step(self, action: int):
+            reward = 0.0
+            terminated = False
+            truncated = False
+
+            self.t += 1
+
+            if self.t < self.delay:
+                if int(action) != 0:
+                    reward = -1.0
+            else:
+                reward = 1.0 if int(action) == self.cue else -1.0
+                terminated = True
+
+            return self._obs(), float(reward), terminated, truncated, {}
 
 
 def make_env(env_id: str) -> Any:
@@ -38,6 +104,8 @@ def make_env(env_id: str) -> Any:
             "gym/gymnasium not installed. "
             "Install with: pip install gym or pip install gymnasium"
         )
+    if env_id == "DelayedCue-v0":
+        return DelayedCueEnv()
     return gym.make(env_id)
 
 

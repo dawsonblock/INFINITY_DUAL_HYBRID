@@ -304,6 +304,7 @@ class PPOTrainer:
         total_entropy = 0.0
         total_kl = 0.0
         total_grad_norm = 0.0
+        total_memory_gate_loss = 0.0
         num_updates = 0
 
         for epoch in range(cfg.train_epochs):
@@ -321,8 +322,12 @@ class PPOTrainer:
                 _ = old_values[mb_idx]  # Reserved for value clipping
 
                 # Evaluate actions
-                new_logp, new_values, entropy = self.agent.evaluate_actions(
-                    mb_obs, mb_actions, advantage=mb_adv
+                new_logp, new_values, entropy, write_prob = (
+                    self.agent.evaluate_actions(
+                        mb_obs,
+                        mb_actions,
+                        advantage=mb_adv,
+                    )
                 )
 
                 # Policy loss (clipped surrogate)
@@ -339,11 +344,16 @@ class PPOTrainer:
                 # Entropy bonus
                 entropy_loss = entropy.mean()
 
+                memory_gate_loss = -(
+                    mb_adv.detach() * torch.log(write_prob + 1e-8)
+                ).mean()
+
                 # Total loss
                 loss = (
                     policy_loss
                     + cfg.value_loss_coef * value_loss
                     - cfg.entropy_coef * entropy_loss
+                    + 0.1 * memory_gate_loss
                 )
 
                 # Optional KL penalty with adaptive coefficient
@@ -383,6 +393,7 @@ class PPOTrainer:
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += entropy_loss.item()
+                total_memory_gate_loss += memory_gate_loss.item()
                 num_updates += 1
 
         # Adaptive KL coefficient adjustment
@@ -406,6 +417,7 @@ class PPOTrainer:
             "entropy": total_entropy / num_updates,
             "kl": total_kl / max(num_updates, 1),
             "grad_norm": total_grad_norm / max(num_updates, 1),
+            "memory_gate_loss": total_memory_gate_loss / num_updates,
             "learning_rate": self.current_lr,
             "kl_coef": self.kl_coef,
             "mean_reward": rollouts.rewards.mean().item(),

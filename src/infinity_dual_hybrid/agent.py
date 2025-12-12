@@ -197,6 +197,11 @@ class InfinityV3DualHybridAgent(nn.Module):
             nn.Linear(d, 1),
         )
 
+        self.memory_write_gate = nn.Sequential(
+            nn.Linear(d, 1),
+            nn.Sigmoid(),
+        )
+
         # Buffer for episode tracking
         self._episode_states: list = []
 
@@ -278,6 +283,8 @@ class InfinityV3DualHybridAgent(nn.Module):
         # Pass through backbone
         encoded = self.backbone(x)  # [B, d_model]
 
+        write_prob = self.memory_write_gate(encoded)
+
         if store_for_ltm and self.ltm is not None and self._mode == "train":
             self._episode_states.append(encoded.detach().cpu())
 
@@ -306,6 +313,7 @@ class InfinityV3DualHybridAgent(nn.Module):
             self._update_memories(
                 encoded=encoded,
                 advantage=advantage,
+                write_strength=write_prob,
                 store_for_ltm=store_for_ltm,
             )
 
@@ -314,6 +322,7 @@ class InfinityV3DualHybridAgent(nn.Module):
             "value": value,
             "encoded": encoded,
             "fused": fused,
+            "write_prob": write_prob,
         }
 
     @torch.no_grad()
@@ -321,6 +330,7 @@ class InfinityV3DualHybridAgent(nn.Module):
         self,
         encoded: torch.Tensor,
         advantage: Optional[torch.Tensor],
+        write_strength: Optional[torch.Tensor],
         store_for_ltm: bool,
     ) -> None:
         """Update Miras and optionally buffer states for LTM."""
@@ -334,6 +344,13 @@ class InfinityV3DualHybridAgent(nn.Module):
                 weight = advantage.abs()
                 if weight.dim() == 1:
                     weight = weight  # [B]
+
+            if write_strength is not None:
+                ws = write_strength.squeeze(-1).detach()
+                if weight is None:
+                    weight = ws
+                else:
+                    weight = weight * ws
 
             self.miras.update(
                 miras_k,
@@ -429,7 +446,7 @@ class InfinityV3DualHybridAgent(nn.Module):
         obs: torch.Tensor,
         actions: torch.Tensor,
         advantage: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Evaluate actions for PPO update.
 
@@ -443,12 +460,13 @@ class InfinityV3DualHybridAgent(nn.Module):
         out = self.forward(obs, advantage=advantage)
         logits = out["logits"]
         value = out["value"]
+        write_prob = out["write_prob"].squeeze(-1)
 
         dist = torch.distributions.Categorical(logits=logits)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
 
-        return log_prob, value, entropy
+        return log_prob, value, entropy, write_prob
 
     @classmethod
     def from_config(cls, cfg: AgentConfig) -> "InfinityV3DualHybridAgent":
