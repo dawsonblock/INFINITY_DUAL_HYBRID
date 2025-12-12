@@ -17,6 +17,27 @@ from .envs import DelayedCueEnv, DelayedCueRegimeEnv, make_envs
 from .ppo_trainer import PPOTrainer
 
 
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        n = 0
+        for s in self._streams:
+            try:
+                n = s.write(data)
+            except Exception:
+                continue
+        return n
+
+    def flush(self) -> None:
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                continue
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -37,6 +58,26 @@ def _set_seeds(seed: int) -> Dict[str, int]:
         "torch": seed,
         "env": seed,
     }
+
+
+def _disable_ltm(cfg: Any) -> None:
+    agent_cfg = getattr(cfg, "agent", None)
+    if agent_cfg is None:
+        return
+
+    if hasattr(agent_cfg, "use_ltm_in_forward"):
+        agent_cfg.use_ltm_in_forward = False
+
+    ltm_cfg = getattr(agent_cfg, "ltm", None)
+    if ltm_cfg is None:
+        return
+
+    if hasattr(ltm_cfg, "use_faiss"):
+        ltm_cfg.use_faiss = False
+    if hasattr(ltm_cfg, "use_async_writer"):
+        ltm_cfg.use_async_writer = False
+    if hasattr(ltm_cfg, "store_on_episode_end"):
+        ltm_cfg.store_on_episode_end = False
 
 
 def _runtime_info() -> Dict[str, Any]:
@@ -265,6 +306,108 @@ def _compute_effective_write(
     return write_prob * w
 
 
+def _nan_inf_grad_check(
+    env_id: str,
+    cfg: Any,
+    device: str,
+) -> Dict[str, Any]:
+    envs = make_envs(env_id, num_envs=1, cfg=cfg)
+    agent = InfinityV3DualHybridAgent(cfg.agent).to(device)
+    trainer = PPOTrainer(agent, cfg.ppo, device=device)
+
+    rollouts = trainer.collect_rollouts(envs)
+
+    obs = rollouts.observations.to(device)
+    actions = rollouts.actions.to(device)
+    old_logp = rollouts.log_probs.to(device)
+    returns = rollouts.returns.to(device)
+    adv_raw = rollouts.advantages.to(device)
+
+    adv = adv_raw
+    if bool(getattr(cfg.ppo, "adv_norm", True)):
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    adv_clip = getattr(cfg.ppo, "adv_clip", None)
+    if adv_clip is not None and adv_clip > 0:
+        adv = torch.clamp(adv, -float(adv_clip), float(adv_clip))
+    adv_used = (
+        torch.clamp(adv, min=0.0)
+        if bool(getattr(cfg.ppo, "adv_positive_only", True))
+        else adv
+    )
+
+    agent.train()
+    trainer.optimizer.zero_grad(set_to_none=True)
+
+    (
+        new_logp,
+        new_values,
+        entropy,
+        write_prob,
+        _effective_write_mean,
+    ) = agent.evaluate_actions(
+        obs,
+        actions,
+        advantage=adv,
+    )
+
+    ratio = (new_logp - old_logp).exp()
+    surr1 = ratio * adv
+    surr2 = torch.clamp(
+        ratio,
+        1.0 - float(cfg.ppo.clip_eps),
+        1.0 + float(cfg.ppo.clip_eps),
+    ) * adv
+    policy_loss = -torch.min(surr1, surr2).mean()
+    value_loss = 0.5 * ((new_values - returns) ** 2).mean()
+    entropy_loss = entropy.mean()
+
+    eps = 1e-8
+    gate = torch.clamp(
+        write_prob,
+        min=float(agent.cfg.write_gate_floor),
+        max=float(agent.cfg.write_gate_ceiling),
+    )
+    memory_gate_loss = -(
+        adv_used.detach() * torch.log(gate + eps)
+    ).mean()
+
+    loss = (
+        policy_loss
+        + float(cfg.ppo.value_loss_coef) * value_loss
+        - float(cfg.ppo.entropy_coef) * entropy_loss
+        + float(cfg.ppo.mem_gate_coef) * memory_gate_loss
+    )
+
+    loss.backward()
+
+    grad_finite = True
+    max_grad_abs = 0.0
+    nan_params = 0
+    inf_params = 0
+
+    for p in agent.parameters():
+        if p.grad is None:
+            continue
+        g = p.grad
+        if not torch.isfinite(g).all():
+            grad_finite = False
+            nan_params += int(torch.isnan(g).any().item())
+            inf_params += int(torch.isinf(g).any().item())
+        max_grad_abs = max(max_grad_abs, float(g.abs().max().item()))
+
+    for env in envs:
+        env.close()
+    agent.shutdown()
+
+    return {
+        "loss_finite": bool(torch.isfinite(loss).item()),
+        "grad_finite": bool(grad_finite),
+        "nan_params": int(nan_params),
+        "inf_params": int(inf_params),
+        "max_grad_abs": float(max_grad_abs),
+    }
+
+
 def _one_update_gate_metrics(
     env_id: str,
     cfg: Any,
@@ -301,6 +444,9 @@ def _one_update_gate_metrics(
 
     effective_write = _compute_effective_write(gate, adv_raw, agent.cfg)
 
+    gate_np = gate.detach().cpu().numpy()
+    eff_np = effective_write.detach().cpu().numpy()
+
     stats = {
         "adv_raw_min": float(adv_raw.min().item()),
         "adv_raw_max": float(adv_raw.max().item()),
@@ -308,7 +454,10 @@ def _one_update_gate_metrics(
         "adv_used_max": float(adv_used.max().item()),
         "write_prob_min": float(gate.min().item()),
         "write_prob_max": float(gate.max().item()),
+        "write_prob_mean": float(gate.mean().item()),
+        "write_prob_p95": float(np.percentile(gate_np, 95)),
         "effective_write_mean": float(effective_write.mean().item()),
+        "effective_write_p95": float(np.percentile(eff_np, 95)),
         "mem_gate_loss": float(mem_gate_loss),
         "finite_logits": bool(_finite_tensor(logits)),
         "finite_value": bool(_finite_tensor(value)),
@@ -466,7 +615,7 @@ def _write_run_commands(
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "python -m infinity_dual_hybrid.validation \\",
+        "PYTHONPATH=src python -m infinity_dual_hybrid.validation \\",
         f"  --out {out_dir} \\",
         f"  --seed {args.seed} \\",
         f"  --device {args.device} \\",
@@ -501,271 +650,336 @@ def main() -> None:
     out_dir = args.out or os.path.join("results", f"validation_{tag}")
     _ensure_dir(out_dir)
 
-    runtime = _runtime_info()
-    seeds = _set_seeds(int(args.seed))
+    log_path = os.path.join(out_dir, "validation.log")
+    log_f = open(log_path, "w", encoding="utf-8")
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = _Tee(old_stdout, log_f)
+    sys.stderr = _Tee(old_stderr, log_f)
 
-    report_lines: List[str] = []
-    report_lines.append("# INFINITY_DUAL_HYBRID Validation Report")
-    report_lines.append("")
-    report_lines.append(f"Output dir: `{out_dir}`")
-    report_lines.append("")
-    report_lines.append("## Runtime")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(runtime, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
-    report_lines.append("## Seeds")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(seeds, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
+    try:
+        runtime = _runtime_info()
+        seeds = _set_seeds(int(args.seed))
 
-    static_checks = [
-        _env_api_check("DelayedCue-v0", seed=args.seed),
-        _env_api_check("DelayedCueRegime-v0", seed=args.seed),
-    ]
+        report_lines: List[str] = []
+        report_lines.append("# INFINITY_DUAL_HYBRID Validation Report")
+        report_lines.append("")
+        report_lines.append(f"Output dir: `{out_dir}`")
+        report_lines.append("")
+        report_lines.append("## Runtime")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(runtime, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
+        report_lines.append("## Seeds")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(seeds, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
 
-    delayedcue_tests = _delayedcue_invariant_tests()
-    regime_tests = _regime_invariant_tests()
+        static_checks = [
+            _env_api_check("DelayedCue-v0", seed=args.seed),
+            _env_api_check("DelayedCueRegime-v0", seed=args.seed),
+        ]
 
-    cfg_full = get_config_for_env("DelayedCue-v0")
-    cfg_full.seed = int(args.seed)
-    cfg_full.device = str(args.device)
+        delayedcue_tests = _delayedcue_invariant_tests()
+        regime_tests = _regime_invariant_tests()
 
-    gate_stats = _one_update_gate_metrics(
-        env_id="DelayedCue-v0",
-        cfg=cfg_full,
-        seed=int(args.seed),
-        device=str(args.device),
-        out_dir=out_dir,
-    )
+        cfg_full = get_config_for_env("DelayedCue-v0")
+        cfg_full.seed = int(args.seed)
+        cfg_full.device = str(args.device)
+        _disable_ltm(cfg_full)
 
-    ablations: Dict[str, Any] = {}
-
-    def make_run_cfg(
-        base_env: str,
-        mem_gate_coef: Optional[float],
-        mode: Optional[str],
-    ):
-        c = get_config_for_env(base_env)
-        c.seed = int(args.seed)
-        c.device = str(args.device)
-        if mem_gate_coef is not None:
-            c.ppo.mem_gate_coef = float(mem_gate_coef)
-        if mode is not None:
-            c.agent.miras_weight_mode = str(mode)
-        return c
-
-    run_defs = {
-        "FULL": make_run_cfg("DelayedCue-v0", None, None),
-        "NO_GATE_LOSS": make_run_cfg("DelayedCue-v0", 0.0, None),
-        "NO_ADV_WEIGHT": make_run_cfg("DelayedCue-v0", None, "none"),
-    }
-
-    for name, c in run_defs.items():
-        agent, hist = _train_run(
+        gate_stats = _one_update_gate_metrics(
             env_id="DelayedCue-v0",
-            cfg=c,
+            cfg=cfg_full,
+            seed=int(args.seed),
             device=str(args.device),
-            iterations=int(args.train_iterations),
+            out_dir=out_dir,
         )
 
-        eval_metrics = _eval_policy_success(
+        grad_check = _nan_inf_grad_check(
             env_id="DelayedCue-v0",
-            cfg=c,
-            agent=agent,
-            episodes=int(args.eval_episodes),
+            cfg=cfg_full,
             device=str(args.device),
         )
 
-        tail = max(1, int(0.2 * len(hist["mean_reward"])))
-        tail_mean = float(np.mean(hist["mean_reward"][-tail:]))
+        ablations: Dict[str, Any] = {}
 
-        ablations[name] = {
-            "train": {
-                "mean_reward_last_20pct": tail_mean,
-                "history": hist,
-            },
-            "eval": eval_metrics,
+        def make_run_cfg(
+            base_env: str,
+            mem_gate_coef: Optional[float],
+            mode: Optional[str],
+        ):
+            c = get_config_for_env(base_env)
+            c.seed = int(args.seed)
+            c.device = str(args.device)
+            _disable_ltm(c)
+            if mem_gate_coef is not None:
+                c.ppo.mem_gate_coef = float(mem_gate_coef)
+            if mode is not None:
+                c.agent.miras_weight_mode = str(mode)
+            return c
+
+        run_defs = {
+            "FULL": make_run_cfg("DelayedCue-v0", None, None),
+            "NO_GATE_LOSS": make_run_cfg("DelayedCue-v0", 0.0, None),
+            "NO_ADV_WEIGHT": make_run_cfg("DelayedCue-v0", None, "none"),
         }
 
-    delays = [int(x.strip()) for x in args.delays.split(",") if x.strip()]
-    delay_sweep: Dict[str, Any] = {"delays": delays, "runs": {}}
-
-    for name in run_defs.keys():
-        delay_sweep["runs"][name] = {"mean_return": [], "success_rate": []}
-
-    for d in delays:
-        for name in run_defs.keys():
-            c = make_run_cfg("DelayedCue-v0", None, None)
-            if name == "NO_GATE_LOSS":
-                c.ppo.mem_gate_coef = 0.0
-            if name == "NO_ADV_WEIGHT":
-                c.agent.miras_weight_mode = "none"
-            c.delayedcue_delay = int(d)
-
-            agent, _ = _train_run(
+        for name, c in run_defs.items():
+            agent, hist = _train_run(
                 env_id="DelayedCue-v0",
                 cfg=c,
                 device=str(args.device),
-                iterations=max(1, int(args.train_iterations // 2)),
+                iterations=int(args.train_iterations),
             )
-            m = _eval_policy_success(
+
+            eval_metrics = _eval_policy_success(
                 env_id="DelayedCue-v0",
                 cfg=c,
                 agent=agent,
-                episodes=max(10, int(args.eval_episodes // 2)),
+                episodes=int(args.eval_episodes),
                 device=str(args.device),
             )
 
-            delay_sweep["runs"][name]["mean_return"].append(
-                float(m["mean_return"])
+            tail = max(1, int(0.2 * len(hist["mean_reward"])))
+            tail_mean = float(np.mean(hist["mean_reward"][-tail:]))
+
+            ablations[name] = {
+                "train": {
+                    "mean_reward_last_20pct": tail_mean,
+                    "history": hist,
+                },
+                "eval": eval_metrics,
+            }
+
+        delays = [int(x.strip()) for x in args.delays.split(",") if x.strip()]
+        delay_sweep: Dict[str, Any] = {"delays": delays, "runs": {}}
+
+        for name in run_defs.keys():
+            delay_sweep["runs"][name] = {
+                "mean_return": [],
+                "success_rate": [],
+            }
+
+        for d in delays:
+            for name in run_defs.keys():
+                c = make_run_cfg("DelayedCue-v0", None, None)
+                if name == "NO_GATE_LOSS":
+                    c.ppo.mem_gate_coef = 0.0
+                if name == "NO_ADV_WEIGHT":
+                    c.agent.miras_weight_mode = "none"
+                c.delayedcue_delay = int(d)
+
+                agent, _ = _train_run(
+                    env_id="DelayedCue-v0",
+                    cfg=c,
+                    device=str(args.device),
+                    iterations=max(1, int(args.train_iterations // 2)),
+                )
+                m = _eval_policy_success(
+                    env_id="DelayedCue-v0",
+                    cfg=c,
+                    agent=agent,
+                    episodes=max(10, int(args.eval_episodes // 2)),
+                    device=str(args.device),
+                )
+
+                delay_sweep["runs"][name]["mean_return"].append(
+                    float(m["mean_return"])
+                )
+                delay_sweep["runs"][name]["success_rate"].append(
+                    float(m["success_rate"])
+                )
+
+        plt.figure(figsize=(7, 4))
+        for name in run_defs.keys():
+            plt.plot(
+                delays,
+                delay_sweep["runs"][name]["mean_return"],
+                marker="o",
+                label=name,
             )
-            delay_sweep["runs"][name]["success_rate"].append(
-                float(m["success_rate"])
-            )
+        plt.xlabel("delay")
+        plt.ylabel("mean return")
+        plt.title("Reward vs Delay (Ablations)")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "reward_vs_delay.png"))
+        plt.close()
 
-    plt.figure(figsize=(7, 4))
-    for name in run_defs.keys():
-        plt.plot(
-            delays,
-            delay_sweep["runs"][name]["mean_return"],
-            marker="o",
-            label=name,
-        )
-    plt.xlabel("delay")
-    plt.ylabel("mean return")
-    plt.title("Reward vs Delay (Ablations)")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "reward_vs_delay.png"))
-    plt.close()
-
-    cfg_reg = get_config_for_env("DelayedCueRegime-v0")
-    cfg_reg.seed = int(args.seed)
-    cfg_reg.device = str(args.device)
-    agent_reg, hist_reg = _train_run(
-        env_id="DelayedCueRegime-v0",
-        cfg=cfg_reg,
-        device=str(args.device),
-        iterations=int(args.train_iterations),
-    )
-    _ = agent_reg
-
-    plt.figure(figsize=(7, 4))
-    plt.plot(hist_reg["mean_reward"])
-    plt.xlabel("iteration")
-    plt.ylabel("mean reward")
-    plt.title("Regime-Shift Recovery (train mean_reward)")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "regime_shift_recovery.png"))
-    plt.close()
-
-    reg_check_cfg = get_config_for_env("CartPole-v1")
-    reg_check_cfg.seed = int(args.seed)
-    reg_check_cfg.device = str(args.device)
-    try:
-        agent_cp, _ = _train_run(
-            env_id="CartPole-v1",
-            cfg=reg_check_cfg,
+        cfg_reg = get_config_for_env("DelayedCueRegime-v0")
+        cfg_reg.seed = int(args.seed)
+        cfg_reg.device = str(args.device)
+        _disable_ltm(cfg_reg)
+        agent_reg, hist_reg = _train_run(
+            env_id="DelayedCueRegime-v0",
+            cfg=cfg_reg,
             device=str(args.device),
-            iterations=2,
+            iterations=int(args.train_iterations),
         )
-        _ = agent_cp
-        regression_ok = True
-    except Exception as e:
-        regression_ok = False
-        report_lines.append("## Regression")
-        report_lines.append(f"CartPole-v1 training failed: `{e}`")
+        _ = agent_reg
+
+        plt.figure(figsize=(7, 4))
+        plt.plot(hist_reg["mean_reward"])
+        plt.xlabel("iteration")
+        plt.ylabel("mean reward")
+        plt.title("Regime-Shift Recovery (train mean_reward)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "regime_shift_recovery.png"))
+        plt.close()
+
+        reg_check_cfg = get_config_for_env("CartPole-v1")
+        reg_check_cfg.seed = int(args.seed)
+        reg_check_cfg.device = str(args.device)
+        _disable_ltm(reg_check_cfg)
+        try:
+            agent_cp, _ = _train_run(
+                env_id="CartPole-v1",
+                cfg=reg_check_cfg,
+                device=str(args.device),
+                iterations=2,
+            )
+            _ = agent_cp
+            regression_ok = True
+        except Exception as e:
+            regression_ok = False
+            report_lines.append("## Regression")
+            report_lines.append(f"CartPole-v1 training failed: `{e}`")
+            report_lines.append("")
+
+        log_f.flush()
+        try:
+            with open(log_path, "r", encoding="utf-8") as rf:
+                log_text = rf.read().splitlines()
+        except Exception:
+            log_text = []
+
+        backend_lines = [ln for ln in log_text if "SSM backend:" in ln]
+        backend_excerpt = backend_lines[-1] if backend_lines else ""
+
+        metrics = {
+            "runtime": runtime,
+            "seeds": seeds,
+            "ltm_disabled": True,
+            "static_env_checks": static_checks,
+            "env_invariants": {
+                "DelayedCue-v0": delayedcue_tests,
+                "DelayedCueRegime-v0": regime_tests,
+            },
+            "gate_metrics_one_update": gate_stats,
+            "grad_check_one_backward": grad_check,
+            "ssm_backend_excerpt": backend_excerpt,
+            "ablations": ablations,
+            "delay_sweep": delay_sweep,
+            "regime_shift": {
+                "train_mean_reward": hist_reg["mean_reward"],
+            },
+            "regression": {
+                "cartpole_train_ok": bool(regression_ok),
+            },
+            "artifacts": {
+                "validation_log": os.path.basename(log_path),
+            },
+        }
+
+        report_lines.append("## Static env checks")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(static_checks, indent=2))
+        report_lines.append("```")
         report_lines.append("")
 
-    metrics = {
-        "runtime": runtime,
-        "seeds": seeds,
-        "static_env_checks": static_checks,
-        "env_invariants": {
-            "DelayedCue-v0": delayedcue_tests,
-            "DelayedCueRegime-v0": regime_tests,
-        },
-        "gate_metrics_one_update": gate_stats,
-        "ablations": ablations,
-        "delay_sweep": delay_sweep,
-        "regime_shift": {
-            "train_mean_reward": hist_reg["mean_reward"],
-        },
-        "regression": {
-            "cartpole_train_ok": bool(regression_ok),
-        },
-    }
+        report_lines.append("## Env invariants")
+        report_lines.append("### DelayedCue-v0")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(delayedcue_tests, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
 
-    report_lines.append("## Static env checks")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(static_checks, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
+        report_lines.append("### DelayedCueRegime-v0")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(regime_tests, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
 
-    report_lines.append("## Env invariants")
-    report_lines.append("### DelayedCue-v0")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(delayedcue_tests, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
+        report_lines.append("## Advantage-gated MIRAS: one-update evidence")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(gate_stats, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
 
-    report_lines.append("### DelayedCueRegime-v0")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(regime_tests, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
+        report_lines.append("## Gradient finite check (one backward)")
+        report_lines.append("```json")
+        report_lines.append(json.dumps(grad_check, indent=2))
+        report_lines.append("```")
+        report_lines.append("")
 
-    report_lines.append("## Advantage-gated MIRAS: one-update evidence")
-    report_lines.append("```json")
-    report_lines.append(json.dumps(gate_stats, indent=2))
-    report_lines.append("```")
-    report_lines.append("")
+        report_lines.append("## SSM backend excerpt")
+        report_lines.append("```text")
+        report_lines.append(backend_excerpt or "(not found)")
+        report_lines.append("```")
+        report_lines.append("")
 
-    report_lines.append("## Ablations summary")
-    report_lines.append("```json")
-    report_lines.append(
-        json.dumps(
-            {k: v["eval"] for k, v in ablations.items()},
-            indent=2,
+        report_lines.append("## Ablations summary")
+        report_lines.append("```json")
+        report_lines.append(
+            json.dumps(
+                {k: v["eval"] for k, v in ablations.items()},
+                indent=2,
+            )
         )
-    )
-    report_lines.append("```")
-    report_lines.append("")
+        report_lines.append("```")
+        report_lines.append("")
 
-    validated = True
-    if not all(x.get("gymnasium_make_ok") for x in static_checks):
-        validated = False
-    if not all(t["pass"] for t in delayedcue_tests):
-        validated = False
-    if not all(t["pass"] for t in regime_tests):
-        validated = False
-    if not (
-        gate_stats["finite_logits"]
-        and gate_stats["finite_value"]
-        and gate_stats["finite_adv"]
-    ):
-        validated = False
+        validated = True
+        if not all(x.get("gymnasium_make_ok") for x in static_checks):
+            validated = False
+        if not all(t["pass"] for t in delayedcue_tests):
+            validated = False
+        if not all(t["pass"] for t in regime_tests):
+            validated = False
+        if not (
+            gate_stats["finite_logits"]
+            and gate_stats["finite_value"]
+            and gate_stats["finite_adv"]
+        ):
+            validated = False
+        if not bool(grad_check.get("grad_finite", False)):
+            validated = False
 
-    report_lines.append("## Conclusion")
-    report_lines.append("Validated" if validated else "Not validated")
-    report_lines.append("")
-    report_lines.append(
-        "Biggest remaining risk if not validated: gate learning signal may be "
-        "too weak or saturated; inspect write_prob distribution and "
-        "correlation trend."
-    )
+        report_lines.append("## Conclusion")
+        report_lines.append("Validated" if validated else "Not validated")
+        report_lines.append("")
+        report_lines.append(
+            "Biggest remaining risk if not validated: gate learning signal "
+            "may be too weak or saturated; inspect write_prob distribution "
+            "and correlation trend."
+        )
 
-    _write_json(os.path.join(out_dir, "metrics.json"), metrics)
-    _write_report(os.path.join(out_dir, "validation_report.md"), report_lines)
-    _write_run_commands(
-        os.path.join(out_dir, "run_commands.sh"),
-        out_dir,
-        args,
-    )
+        _write_json(os.path.join(out_dir, "metrics.json"), metrics)
+        _write_report(
+            os.path.join(out_dir, "validation_report.md"),
+            report_lines,
+        )
+        _write_run_commands(
+            os.path.join(out_dir, "run_commands.sh"),
+            out_dir,
+            args,
+        )
+    finally:
+        try:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+        except Exception:
+            pass
+        try:
+            log_f.flush()
+            log_f.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
