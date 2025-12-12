@@ -3,8 +3,10 @@ torch>=2.0.0
 numpy>=1.24.0
 
 # Environment
-gymnasium>=0.29.0
-# or: gym>=0.26.0
+gymnasium[classic-control]>=0.29.0
+
+# Benchmark plots
+matplotlib>=3.7.0
 
 # Optional: FAISS for scalable LTM
 # faiss-cpu>=1.7.4

@@ -110,7 +110,7 @@ class PPOTrainer:
         self.current_lr = cfg.learning_rate
 
         # Optional: old policy for KL penalty
-        self._old_policy_params = None
+        self._old_policy_params: Optional[Dict[str, torch.Tensor]] = None
         if cfg.use_kl_penalty:
             self._store_old_policy()
 
@@ -258,11 +258,6 @@ class PPOTrainer:
             advantages[env_idx::num_envs] = all_advantages[env_idx]
             returns[env_idx::num_envs] = all_returns[env_idx]
 
-        # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (
-            advantages.std() + 1e-8
-        )
-
         # Create batch
         return RolloutBatch(
             observations=torch.tensor(np.array(obs_buf), dtype=torch.float32),
@@ -305,6 +300,10 @@ class PPOTrainer:
         total_kl = 0.0
         total_grad_norm = 0.0
         total_memory_gate_loss = 0.0
+        total_write_prob = 0.0
+        total_adv_used = 0.0
+        total_write_prob_adv_corr = 0.0
+        total_effective_write = 0.0
         num_updates = 0
 
         for epoch in range(cfg.train_epochs):
@@ -321,21 +320,33 @@ class PPOTrainer:
                 mb_returns = returns[mb_idx]
                 _ = old_values[mb_idx]  # Reserved for value clipping
 
-                # Evaluate actions
-                new_logp, new_values, entropy, write_prob = (
-                    self.agent.evaluate_actions(
-                        mb_obs,
-                        mb_actions,
-                        advantage=mb_adv,
-                    )
+                adv = mb_adv
+                if cfg.adv_norm:
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                if cfg.adv_clip is not None and cfg.adv_clip > 0:
+                    adv = torch.clamp(adv, -cfg.adv_clip, cfg.adv_clip)
+                adv_used = (
+                    torch.clamp(adv, min=0.0) if cfg.adv_positive_only else adv
+                )
+
+                (
+                    new_logp,
+                    new_values,
+                    entropy,
+                    write_prob,
+                    effective_write_mean,
+                ) = self.agent.evaluate_actions(
+                    mb_obs,
+                    mb_actions,
+                    advantage=adv,
                 )
 
                 # Policy loss (clipped surrogate)
                 ratio = (new_logp - mb_old_logp).exp()
-                surr1 = ratio * mb_adv
+                surr1 = ratio * adv
                 surr2 = torch.clamp(
                     ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps
-                ) * mb_adv
+                ) * adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss (optionally clipped)
@@ -344,16 +355,29 @@ class PPOTrainer:
                 # Entropy bonus
                 entropy_loss = entropy.mean()
 
+                eps = 1e-8
+                gate = torch.clamp(
+                    write_prob,
+                    min=float(self.agent.cfg.write_gate_floor),
+                    max=float(self.agent.cfg.write_gate_ceiling),
+                )
                 memory_gate_loss = -(
-                    mb_adv.detach() * torch.log(write_prob + 1e-8)
+                    adv_used.detach() * torch.log(gate + eps)
                 ).mean()
+
+                x = adv_used.detach()
+                y = write_prob.detach()
+                x0 = x - x.mean()
+                y0 = y - y.mean()
+                denom = (x0.std() * y0.std()) + 1e-8
+                corr = float((x0 * y0).mean().item() / denom.item())
 
                 # Total loss
                 loss = (
                     policy_loss
                     + cfg.value_loss_coef * value_loss
                     - cfg.entropy_coef * entropy_loss
-                    + 0.1 * memory_gate_loss
+                    + cfg.mem_gate_coef * memory_gate_loss
                 )
 
                 # Optional KL penalty with adaptive coefficient
@@ -394,6 +418,10 @@ class PPOTrainer:
                 total_value_loss += value_loss.item()
                 total_entropy += entropy_loss.item()
                 total_memory_gate_loss += memory_gate_loss.item()
+                total_write_prob += float(write_prob.mean().item())
+                total_adv_used += float(adv_used.mean().item())
+                total_write_prob_adv_corr += corr
+                total_effective_write += float(effective_write_mean.item())
                 num_updates += 1
 
         # Adaptive KL coefficient adjustment
@@ -418,6 +446,10 @@ class PPOTrainer:
             "kl": total_kl / max(num_updates, 1),
             "grad_norm": total_grad_norm / max(num_updates, 1),
             "memory_gate_loss": total_memory_gate_loss / num_updates,
+            "mean_write_prob": total_write_prob / num_updates,
+            "mean_adv_used": total_adv_used / num_updates,
+            "write_prob_adv_corr": total_write_prob_adv_corr / num_updates,
+            "effective_write_mean": total_effective_write / num_updates,
             "learning_rate": self.current_lr,
             "kl_coef": self.kl_coef,
             "mean_reward": rollouts.rewards.mean().item(),
@@ -481,9 +513,9 @@ class PPOTrainer:
             self.agent.reset_episode()
 
         return {
-            "eval_mean_reward": np.mean(episode_rewards),
-            "eval_std_reward": np.std(episode_rewards),
-            "eval_mean_length": np.mean(episode_lengths),
+            "eval_mean_reward": float(np.mean(episode_rewards)),
+            "eval_std_reward": float(np.std(episode_rewards)),
+            "eval_mean_length": float(np.mean(episode_lengths)),
         }
 
     def save(self, path: str) -> None:

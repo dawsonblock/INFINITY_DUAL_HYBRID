@@ -22,6 +22,7 @@ from typing import Optional
 
 import torch
 import numpy as np
+from gymnasium.envs.registration import register
 
 from .config import TrainConfig, get_config_for_env
 from .agent import InfinityV3DualHybridAgent
@@ -57,11 +58,28 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     print(f"Iterations: {cfg.ppo.max_iterations}")
     print("=" * 60)
 
+    if cfg.env_register_local:
+        try:
+            register(
+                id="DelayedCue-v0",
+                entry_point="infinity_dual_hybrid.envs:DelayedCueEnv",
+            )
+        except Exception:
+            pass
+
+        try:
+            register(
+                id="DelayedCueRegime-v0",
+                entry_point="infinity_dual_hybrid.envs:DelayedCueRegimeEnv",
+            )
+        except Exception:
+            pass
+
     # Set seed
     set_seed(cfg.seed)
 
     # Get environment info and update config
-    env_info = get_env_info(cfg.env_id)
+    env_info = get_env_info(cfg.env_id, cfg=cfg)
     cfg.agent.obs_dim = env_info["obs_dim"]
     cfg.agent.act_dim = env_info["act_dim"]
 
@@ -70,7 +88,7 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     print("=" * 60)
 
     # Create environments
-    envs = make_envs(cfg.env_id, cfg.ppo.num_envs)
+    envs = make_envs(cfg.env_id, cfg.ppo.num_envs, cfg=cfg)
 
     # Create agent
     agent = InfinityV3DualHybridAgent(cfg.agent).to(cfg.device)

@@ -124,6 +124,12 @@ class AgentConfig:
     mode: str = "train"  # "train", "eval", "inference"
     temperature: float = 1.0  # Policy temperature for discrete actions
 
+    log_mamba_backend: bool = True
+
+    miras_weight_mode: str = "abs_adv"  # ["abs_adv", "pos_adv", "none"]
+    write_gate_floor: float = 0.0
+    write_gate_ceiling: float = 1.0
+
     def __post_init__(self):
         self.sync_dims()
 
@@ -179,6 +185,11 @@ class PPOConfig:
     lr_reduce_factor: float = 0.5     # LR reduction on explosion
     track_grad_norm: bool = True      # Log gradient norms
 
+    mem_gate_coef: float = 0.01
+    adv_norm: bool = True
+    adv_clip: float = 5.0
+    adv_positive_only: bool = True
+
 
 @dataclass
 class TrainConfig:
@@ -198,6 +209,15 @@ class TrainConfig:
     log_interval: int = 1
     save_interval: int = 10
     save_path: str = "checkpoints"
+
+    env_register_local: bool = True
+
+    delayedcue_episode_len: int = 2000
+    delayedcue_cue_time: int = 50
+    delayedcue_delay: int = 1000
+    delayedcue_window: int = 25
+    delayedcue_noise_std: float = 0.1
+    delayedcue_step_penalty: float = -0.001
 
     # Reproducibility
     seed: Optional[int] = None
@@ -243,5 +263,12 @@ def get_config_for_env(env_id: str) -> TrainConfig:
         cfg.ppo.steps_per_rollout = 4096
         cfg.ppo.gamma = 0.999
         cfg.ppo.gae_lambda = 0.97
+
+        cfg.delayedcue_episode_len = 2000
+        cfg.delayedcue_cue_time = 50
+        cfg.delayedcue_delay = 1000
+        cfg.delayedcue_window = 25
+        cfg.delayedcue_noise_std = 0.1
+        cfg.delayedcue_step_penalty = -0.001
 
     return cfg

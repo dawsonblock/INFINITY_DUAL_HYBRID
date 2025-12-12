@@ -154,6 +154,12 @@ class InfinityV3DualHybridAgent(nn.Module):
         # Backbone
         self.backbone = HybridSSMAttentionBackbone(cfg.backbone)
 
+        if cfg.log_mamba_backend:
+            backend = (
+                "Mamba2" if len(self.backbone.mamba_layers) > 0 else "fallback"
+            )
+            print(f"SSM backend: {backend}")
+
         # Dual-Tier Miras
         if cfg.use_miras_in_forward:
             self.miras = DualTierMiras.from_config(cfg.miras)
@@ -284,6 +290,23 @@ class InfinityV3DualHybridAgent(nn.Module):
         encoded = self.backbone(x)  # [B, d_model]
 
         write_prob = self.memory_write_gate(encoded)
+        gate = torch.clamp(
+            write_prob,
+            min=float(self.cfg.write_gate_floor),
+            max=float(self.cfg.write_gate_ceiling),
+        )
+
+        effective_write = None
+        if advantage is not None:
+            mode = self.cfg.miras_weight_mode
+            if mode == "abs_adv":
+                miras_w = advantage.abs()
+            elif mode == "pos_adv":
+                miras_w = torch.clamp(advantage, min=0.0)
+            else:
+                miras_w = torch.ones_like(advantage)
+
+            effective_write = gate.squeeze(-1) * miras_w
 
         if store_for_ltm and self.ltm is not None and self._mode == "train":
             self._episode_states.append(encoded.detach().cpu())
@@ -313,7 +336,7 @@ class InfinityV3DualHybridAgent(nn.Module):
             self._update_memories(
                 encoded=encoded,
                 advantage=advantage,
-                write_strength=write_prob,
+                write_strength=effective_write,
                 store_for_ltm=store_for_ltm,
             )
 
@@ -322,7 +345,12 @@ class InfinityV3DualHybridAgent(nn.Module):
             "value": value,
             "encoded": encoded,
             "fused": fused,
-            "write_prob": write_prob,
+            "write_prob": gate,
+            "effective_write_mean": (
+                effective_write.mean()
+                if effective_write is not None
+                else torch.tensor(0.0, device=encoded.device)
+            ),
         }
 
     @torch.no_grad()
@@ -340,17 +368,8 @@ class InfinityV3DualHybridAgent(nn.Module):
             miras_target = self.miras_val_proj(encoded).detach()
 
             weight = None
-            if advantage is not None:
-                weight = advantage.abs()
-                if weight.dim() == 1:
-                    weight = weight  # [B]
-
             if write_strength is not None:
-                ws = write_strength.squeeze(-1).detach()
-                if weight is None:
-                    weight = ws
-                else:
-                    weight = weight * ws
+                weight = write_strength.detach()
 
             self.miras.update(
                 miras_k,
@@ -446,7 +465,13 @@ class InfinityV3DualHybridAgent(nn.Module):
         obs: torch.Tensor,
         actions: torch.Tensor,
         advantage: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """
         Evaluate actions for PPO update.
 
@@ -461,12 +486,13 @@ class InfinityV3DualHybridAgent(nn.Module):
         logits = out["logits"]
         value = out["value"]
         write_prob = out["write_prob"].squeeze(-1)
+        effective_write_mean = out["effective_write_mean"]
 
         dist = torch.distributions.Categorical(logits=logits)
         log_prob = dist.log_prob(actions)
         entropy = dist.entropy()
 
-        return log_prob, value, entropy, write_prob
+        return log_prob, value, entropy, write_prob, effective_write_mean
 
     @classmethod
     def from_config(cls, cfg: AgentConfig) -> "InfinityV3DualHybridAgent":

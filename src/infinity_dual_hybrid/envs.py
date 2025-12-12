@@ -9,84 +9,152 @@ Provides:
 - Multi-environment support
 """
 
-from typing import List, Tuple, Any, Optional, Dict
+from typing import List, Tuple, Any, Optional
 import numpy as np
 
-try:
-    import gymnasium as gym
-    HAS_GYM = True
-except ImportError:
-    gym = None
-    HAS_GYM = False
+import gymnasium as gym
+from gymnasium import spaces
 
 
-if HAS_GYM:
+class DelayedCueEnv(gym.Env):
+    def __init__(
+        self,
+        episode_len: int = 2000,
+        cue_time: int = 50,
+        delay: int = 1000,
+        window: int = 25,
+        noise_std: float = 0.1,
+        step_penalty: float = -0.001,
+        action_mode: str = "discrete",
+    ):
+        super().__init__()
+        assert action_mode == "discrete"
+        self.episode_len = int(episode_len)
+        self.cue_time = int(cue_time)
+        self.delay = int(delay)
+        self.window = int(window)
+        self.noise_std = float(noise_std)
+        self.step_penalty = float(step_penalty)
 
-    class DelayedCueEnv(gym.Env):
-        def __init__(
-            self,
-            delay: int = 1000,
-            noise_dim: int = 4,
-            regime_shift: bool = False,
-        ):
-            super().__init__()
-            self.delay = int(delay)
-            self.noise_dim = int(noise_dim)
-            self.regime_shift = bool(regime_shift)
+        self.observation_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(5,),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Discrete(2)
 
-            self.observation_space = gym.spaces.Box(
-                low=-1.0,
-                high=1.0,
-                shape=(self.noise_dim + 1,),
-                dtype=np.float32,
+        self.t = 0
+        self._cue_seen = False
+
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ):
+        _ = options
+        super().reset(seed=seed)
+        self.t = 0
+        self._cue_seen = False
+        return self._obs(), {}
+
+    def _target_time(self) -> int:
+        return int(self.cue_time + self.delay)
+
+    def _in_window(self) -> bool:
+        return (
+            self._target_time()
+            <= self.t
+            <= (self._target_time() + self.window)
+        )
+
+    def _obs(self) -> np.ndarray:
+        cue_bit = 1.0 if self.t == self.cue_time else 0.0
+        if cue_bit > 0:
+            self._cue_seen = True
+
+        t_norm = float(self.t) / max(float(self.episode_len), 1.0)
+        if self._cue_seen:
+            ts_norm = float(self.t - self.cue_time) / max(
+                float(self.episode_len),
+                1.0,
             )
-            self.action_space = gym.spaces.Discrete(2)
+        else:
+            ts_norm = 0.0
 
-            self.t = 0
-            self.cue_time = 0
-            self.cue = 0
+        target_time_norm = float(self._target_time()) / max(
+            float(self.episode_len),
+            1.0,
+        )
+        noise = float(np.random.randn() * self.noise_std)
 
-        def reset(
-            self,
-            *,
-            seed: Optional[int] = None,
-            options: Optional[Dict[str, Any]] = None,
-        ):
-            _ = options
-            super().reset(seed=seed)
-            if self.regime_shift:
-                self.delay = int(np.random.choice([200, 500, 1000, 2000]))
-            self.t = 0
-            self.cue_time = int(np.random.randint(10, 50))
-            self.cue = int(np.random.randint(0, 2))
-            return self._obs(), {}
+        obs = np.array(
+            [cue_bit, t_norm, ts_norm, target_time_norm, noise],
+            dtype=np.float32,
+        )
+        return obs
 
-        def _obs(self) -> np.ndarray:
-            cue_value = float(self.cue) if self.t == self.cue_time else 0.0
-            noise = np.random.randn(self.noise_dim).astype(np.float32) * 0.1
-            obs = np.concatenate(
-                [noise, np.array([cue_value], dtype=np.float32)]
-            )
-            return obs.astype(np.float32)
+    def step(self, action: int):
+        action = int(action)
+        reward = float(self.step_penalty)
 
-        def step(self, action: int):
-            reward = 0.0
-            terminated = False
-            truncated = False
+        self.t += 1
 
-            self.t += 1
+        if action == 1 and not self._in_window():
+            return self._obs(), -1.0, True, False, {}
 
-            if self.t < self.delay:
-                if int(action) != 0:
-                    reward = -1.0
-            else:
-                reward = 1.0 if int(action) == self.cue else -1.0
-                terminated = True
+        if action == 1 and self._in_window():
+            return self._obs(), 10.0, True, False, {}
 
-            return self._obs(), float(reward), terminated, truncated, {}
+        if self.t >= self.episode_len:
+            return self._obs(), reward, False, True, {}
+
+        return self._obs(), reward, False, False, {}
 
 
-def make_env(env_id: str) -> Any:
+class DelayedCueRegimeEnv(DelayedCueEnv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shift_time = self.episode_len // 2
+        self.regime = 0
+
+    def reset(
+        self,
+        *,
+        seed: Optional[int] = None,
+        options: Optional[dict] = None,
+    ):
+        obs, info = super().reset(seed=seed, options=options)
+        self.shift_time = self.episode_len // 2
+        self.regime = 0
+        return obs, info
+
+    def step(self, action: int):
+        if self.t >= self.shift_time:
+            self.regime = 1
+
+        action = int(action)
+        reward = float(self.step_penalty)
+
+        self.t += 1
+
+        if self._in_window():
+            correct = 1 if self.regime == 0 else 0
+            if action == 1:
+                rew = 10.0 if correct == 1 else -1.0
+                return self._obs(), rew, True, False, {}
+
+        if action == 1 and not self._in_window():
+            return self._obs(), -1.0, True, False, {}
+
+        if self.t >= self.episode_len:
+            return self._obs(), reward, False, True, {}
+
+        return self._obs(), reward, False, False, {}
+
+
+def make_env(env_id: str, cfg: Optional[Any] = None) -> Any:
     """
     Create a single environment.
 
@@ -95,19 +163,36 @@ def make_env(env_id: str) -> Any:
     Returns:
         Gym environment instance
     """
-    if not HAS_GYM:
-        raise ImportError(
-            "gym/gymnasium not installed. "
-            "Install with: pip install gym or pip install gymnasium"
-        )
     if env_id == "DelayedCue-v0":
-        return DelayedCueEnv()
+        return DelayedCueEnv(
+            episode_len=int(getattr(cfg, "delayedcue_episode_len", 2000)),
+            cue_time=int(getattr(cfg, "delayedcue_cue_time", 50)),
+            delay=int(getattr(cfg, "delayedcue_delay", 1000)),
+            window=int(getattr(cfg, "delayedcue_window", 25)),
+            noise_std=float(getattr(cfg, "delayedcue_noise_std", 0.1)),
+            step_penalty=float(
+                getattr(cfg, "delayedcue_step_penalty", -0.001)
+            ),
+        )
     if env_id == "DelayedCueRegime-v0":
-        return DelayedCueEnv(regime_shift=True)
+        return DelayedCueRegimeEnv(
+            episode_len=int(getattr(cfg, "delayedcue_episode_len", 2000)),
+            cue_time=int(getattr(cfg, "delayedcue_cue_time", 50)),
+            delay=int(getattr(cfg, "delayedcue_delay", 1000)),
+            window=int(getattr(cfg, "delayedcue_window", 25)),
+            noise_std=float(getattr(cfg, "delayedcue_noise_std", 0.1)),
+            step_penalty=float(
+                getattr(cfg, "delayedcue_step_penalty", -0.001)
+            ),
+        )
     return gym.make(env_id)
 
 
-def make_envs(env_id: str, num_envs: int = 1) -> List[Any]:
+def make_envs(
+    env_id: str,
+    num_envs: int = 1,
+    cfg: Optional[Any] = None,
+) -> List[Any]:
     """
     Create multiple environments.
 
@@ -117,7 +202,7 @@ def make_envs(env_id: str, num_envs: int = 1) -> List[Any]:
     Returns:
         List of Gym environment instances
     """
-    return [make_env(env_id) for _ in range(num_envs)]
+    return [make_env(env_id, cfg=cfg) for _ in range(num_envs)]
 
 
 class RunningMeanStd:
@@ -298,7 +383,7 @@ def wrap_env(
     return env
 
 
-def get_env_info(env_id: str) -> dict:
+def get_env_info(env_id: str, cfg: Optional[Any] = None) -> dict:
     """
     Get environment observation and action dimensions.
 
@@ -307,7 +392,7 @@ def get_env_info(env_id: str) -> dict:
     Returns:
         Dict with obs_dim and act_dim
     """
-    env = make_env(env_id)
+    env = make_env(env_id, cfg=cfg)
 
     # Get observation dimension
     obs_space = env.observation_space
