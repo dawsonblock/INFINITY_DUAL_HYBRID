@@ -1,10 +1,18 @@
 # Infinity Dual Hybrid - Lean Build
 
-A production-grade reinforcement learning architecture combining state-space models, parametric memory, and episodic long-term memory.
+A production-grade reinforcement learning framework combining state-space models, parametric memory, episodic long-term memory, and PPO.
+
+## Highlights
+
+- **Hybrid backbone**: Mamba2 (SSM) + optional attention
+- **Dual-Tier Miras**: fast (SGD) + deep (momentum/retention) parametric memory
+- **Optional episodic LTM**: FAISS IVF-PQ (when enabled)
+- **PPO trainer**: GAE, clipped surrogate, entropy bonus, adaptive KL
+- **UnifiedLogger**: console + CSV/JSONL + TensorBoard (optional)
 
 ## Architecture
 
-```
+```text
 Observation → Encoder → Hybrid Backbone → Memory Fusion → Policy/Value Heads
                               ↓                ↑
                          Mamba2 + Attention    │
@@ -21,7 +29,7 @@ Observation → Encoder → Hybrid Backbone → Memory Fusion → Policy/Value H
 
 ## Project Structure
 
-```
+```text
 INFINITY_DUAL_HYBRID_LEAN/
 ├── README.md
 ├── requirements.txt
@@ -52,14 +60,13 @@ INFINITY_DUAL_HYBRID_LEAN/
 ## Installation
 
 ```bash
-# Clone and enter directory
 cd INFINITY_DUAL_HYBRID_LEAN
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Optional: Install as package
+# Recommended (editable install)
 pip install -e .
+
+# Dev tools (tests/formatting)
+pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -70,11 +77,11 @@ pip install -e .
 # Run from repo root
 cd INFINITY_DUAL_HYBRID_LEAN
 
-# Install as package (recommended)
-pip install -e .
-
 # Quick sanity test
 python -m infinity_dual_hybrid.train --test
+
+# Full training via console script
+infinity-train --env CartPole-v1 --iterations 50
 
 # Train baseline (no memory)
 python scripts/train_cartpole_baseline.py
@@ -162,6 +169,7 @@ python -m pytest tests/ -v
 ### Dual-Tier Miras (Parametric)
 
 Fast-adapting working memory with two tiers:
+
 - **Fast Tier**: Direct SGD updates for rapid adaptation
 - **Deep Tier**: Momentum-based updates with Huber loss and retention gating
 
