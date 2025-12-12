@@ -140,10 +140,11 @@ class DelayedCueRegimeEnv(DelayedCueEnv):
         self.t += 1
 
         if self._in_window():
-            correct = 1 if self.regime == 0 else 0
-            if action == 1:
-                rew = 10.0 if correct == 1 else -1.0
-                return self._obs(), rew, True, False, {}
+            correct_action = 1 if self.regime == 0 else 0
+            if action == correct_action:
+                return self._obs(), 10.0, True, False, {}
+            if action == 1 and correct_action != 1:
+                return self._obs(), -1.0, True, False, {}
 
         if action == 1 and not self._in_window():
             return self._obs(), -1.0, True, False, {}
