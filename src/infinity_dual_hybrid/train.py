@@ -16,8 +16,14 @@ This script:
 """
 
 import argparse
+import json
 import os
+import random
+import shlex
+import sys
 import time
+from dataclasses import asdict
+from datetime import datetime
 from typing import Optional
 
 import torch
@@ -35,13 +41,65 @@ def set_seed(seed: Optional[int]) -> None:
     """Set random seeds for reproducibility."""
     if seed is None:
         return
+    random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
 
 
-def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
+def _now_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _sanitize_run_name(s: str) -> str:
+    safe = []
+    for ch in str(s):
+        if ch.isalnum() or ch in ("_", "-", "."):
+            safe.append(ch)
+        else:
+            safe.append("_")
+    out = "".join(safe).strip("_ ")
+    return out or "run"
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _write_json(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def _write_run_commands(path: str) -> None:
+    cmd = "PYTHONPATH=src python3 -m infinity_dual_hybrid.train " + " ".join(
+        shlex.quote(a) for a in sys.argv[1:]
+    )
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        cmd,
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(path, 0o755)
+    except Exception:
+        pass
+
+
+def train(
+    cfg: TrainConfig,
+    out_dir: Optional[str] = None,
+) -> InfinityV3DualHybridAgent:
     """
     Main training loop.
 
@@ -56,6 +114,8 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     print(f"Environment: {cfg.env_id}")
     print(f"Device: {cfg.device}")
     print(f"Iterations: {cfg.ppo.max_iterations}")
+    if out_dir:
+        print(f"Output dir: {out_dir}")
     print("=" * 60)
 
     if cfg.env_register_local:
@@ -98,7 +158,7 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     print(f"Model parameters: {num_params:,}")
 
     # Create trainer
-    trainer = PPOTrainer(agent, cfg.ppo, device=cfg.device)
+    trainer = PPOTrainer(agent, cfg.ppo, device=cfg.device, seed=cfg.seed)
 
     # Create save directory
     if cfg.save_path:
@@ -108,7 +168,15 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     start_time = time.time()
     best_eval_reward = float("-inf")
 
-    with create_logger() as logger:
+    if out_dir:
+        _write_json(os.path.join(out_dir, "config.json"), asdict(cfg))
+
+    logger_cm = (
+        create_logger(log_dir=out_dir, experiment_name="")
+        if out_dir
+        else create_logger()
+    )
+    with logger_cm as logger:
         for iteration in range(1, cfg.ppo.max_iterations + 1):
             iter_start = time.time()
 
@@ -175,6 +243,21 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
                     "miras_mix_ratio": (
                         miras_dbg.get("mix_ratio") if miras_dbg else None
                     ),
+                    "miras_fast_err_l2": (
+                        miras_dbg.get("fast_err_l2") if miras_dbg else None
+                    ),
+                    "miras_deep_err_l2": (
+                        miras_dbg.get("deep_err_l2") if miras_dbg else None
+                    ),
+                    "miras_deep_retention": (
+                        miras_dbg.get("deep_retention") if miras_dbg else None
+                    ),
+                    "miras_deep_gradB_norm": (
+                        miras_dbg.get("deep_gradB_norm") if miras_dbg else None
+                    ),
+                    "miras_deep_gradC_norm": (
+                        miras_dbg.get("deep_gradC_norm") if miras_dbg else None
+                    ),
                     "ltm_size": (ltm_dbg.get("size") if ltm_dbg else 0),
                     **train_stats,
                     **eval_stats,
@@ -215,6 +298,19 @@ def train(cfg: TrainConfig) -> InfinityV3DualHybridAgent:
     print(f"Training complete in {total_time:.2f}s")
     print(f"Best eval reward: {best_eval_reward:.2f}")
     print("=" * 60)
+
+    if out_dir:
+        _write_json(
+            os.path.join(out_dir, "metrics.json"),
+            {
+                "env_id": str(cfg.env_id),
+                "seed": cfg.seed,
+                "device": str(cfg.device),
+                "max_iterations": int(cfg.ppo.max_iterations),
+                "best_eval_reward": float(best_eval_reward),
+                "total_time_seconds": float(total_time),
+            },
+        )
 
     return agent
 
@@ -295,12 +391,31 @@ def parse_args() -> argparse.Namespace:
         help="Evaluation interval"
     )
 
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="results",
+        help="Base results directory",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Run name (subdir under --out)",
+    )
+
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
     args = parse_args()
+
+    run_name = _sanitize_run_name(args.run_name or f"train_{args.env}")
+    tag = _now_tag()
+    out_dir = os.path.join(str(args.out), run_name, tag)
+    _ensure_dir(out_dir)
+    _write_run_commands(os.path.join(out_dir, "run_commands.sh"))
 
     # Build config from args
     cfg = get_config_for_env(args.env)
@@ -309,7 +424,10 @@ def main():
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     cfg.seed = args.seed
-    cfg.save_path = args.save_path
+    if os.path.isabs(str(args.save_path)):
+        cfg.save_path = str(args.save_path)
+    else:
+        cfg.save_path = os.path.join(out_dir, str(args.save_path))
 
     # PPO config
     cfg.ppo.max_iterations = args.iterations
@@ -328,7 +446,7 @@ def main():
     cfg.agent.sync_dims()  # Sync dimensions after modifications
 
     # Train
-    train(cfg)
+    train(cfg, out_dir=out_dir)
 
 
 def quick_test():
@@ -377,7 +495,6 @@ def quick_test():
 
 
 if __name__ == "__main__":
-    import sys
     if "--test" in sys.argv:
         quick_test()
     else:

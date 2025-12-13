@@ -96,10 +96,13 @@ class PPOTrainer:
         agent: InfinityV3DualHybridAgent,
         cfg: PPOConfig,
         device: str = "cpu",
+        seed: Optional[int] = None,
     ):
         self.agent = agent
         self.cfg = cfg
         self.device = device
+        self.seed = seed
+        self._seeded_env_ids = set()
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -155,8 +158,19 @@ class PPOTrainer:
 
         # Current observations
         current_obs = []
-        for env in envs:
-            reset_out = env.reset()
+        for i, env in enumerate(envs):
+            needs_seed = (
+                self.seed is not None
+                and id(env) not in self._seeded_env_ids
+            )
+            if needs_seed:
+                try:
+                    reset_out = env.reset(seed=int(self.seed) + int(i))
+                except TypeError:
+                    reset_out = env.reset()
+                self._seeded_env_ids.add(id(env))
+            else:
+                reset_out = env.reset()
             obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
             current_obs.append(obs)
 
@@ -301,7 +315,11 @@ class PPOTrainer:
         total_grad_norm = 0.0
         total_memory_gate_loss = 0.0
         total_write_prob = 0.0
+        write_prob_min = float("inf")
+        write_prob_max = float("-inf")
         total_adv_used = 0.0
+        adv_used_min = float("inf")
+        adv_used_max = float("-inf")
         total_write_prob_adv_corr = 0.0
         total_effective_write = 0.0
         num_updates = 0
@@ -340,6 +358,17 @@ class PPOTrainer:
                     mb_actions,
                     advantage=adv,
                 )
+
+                if not bool(torch.isfinite(new_logp).all().item()):
+                    raise FloatingPointError("Non-finite PPO new_logp")
+                if not bool(torch.isfinite(new_values).all().item()):
+                    raise FloatingPointError("Non-finite PPO new_values")
+                if not bool(torch.isfinite(entropy).all().item()):
+                    raise FloatingPointError("Non-finite PPO entropy")
+                if not bool(torch.isfinite(write_prob).all().item()):
+                    raise FloatingPointError("Non-finite PPO write_prob")
+                if not bool(torch.isfinite(adv).all().item()):
+                    raise FloatingPointError("Non-finite PPO advantage")
 
                 # Policy loss (clipped surrogate)
                 ratio = (new_logp - mb_old_logp).exp()
@@ -380,6 +409,9 @@ class PPOTrainer:
                     + cfg.mem_gate_coef * memory_gate_loss
                 )
 
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError("Non-finite PPO loss")
+
                 # Optional KL penalty with adaptive coefficient
                 if cfg.use_kl_penalty:
                     kl = (mb_old_logp - new_logp).mean()
@@ -419,7 +451,17 @@ class PPOTrainer:
                 total_entropy += entropy_loss.item()
                 total_memory_gate_loss += memory_gate_loss.item()
                 total_write_prob += float(write_prob.mean().item())
+                write_prob_min = min(
+                    write_prob_min,
+                    float(write_prob.min().item()),
+                )
+                write_prob_max = max(
+                    write_prob_max,
+                    float(write_prob.max().item()),
+                )
                 total_adv_used += float(adv_used.mean().item())
+                adv_used_min = min(adv_used_min, float(adv_used.min().item()))
+                adv_used_max = max(adv_used_max, float(adv_used.max().item()))
                 total_write_prob_adv_corr += corr
                 total_effective_write += float(effective_write_mean.item())
                 num_updates += 1
@@ -447,7 +489,11 @@ class PPOTrainer:
             "grad_norm": total_grad_norm / max(num_updates, 1),
             "memory_gate_loss": total_memory_gate_loss / num_updates,
             "mean_write_prob": total_write_prob / num_updates,
+            "write_prob_min": write_prob_min,
+            "write_prob_max": write_prob_max,
             "mean_adv_used": total_adv_used / num_updates,
+            "adv_used_min": adv_used_min,
+            "adv_used_max": adv_used_max,
             "write_prob_adv_corr": total_write_prob_adv_corr / num_updates,
             "effective_write_mean": total_effective_write / num_updates,
             "learning_rate": self.current_lr,
@@ -478,9 +524,15 @@ class PPOTrainer:
         episode_rewards = []
         episode_lengths = []
 
-        for _ in range(num_episodes):
+        for ep in range(num_episodes):
             env = envs[0]  # Use first env
-            reset_out = env.reset()
+            if self.seed is not None:
+                try:
+                    reset_out = env.reset(seed=int(self.seed) + int(ep))
+                except TypeError:
+                    reset_out = env.reset()
+            else:
+                reset_out = env.reset()
             obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
 
             done = False

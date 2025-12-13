@@ -44,7 +44,9 @@ INFINITY_DUAL_HYBRID_LEAN/
 │       ├── agent.py           # InfinityV3DualHybridAgent
 │       ├── ppo_trainer.py     # PPO with GAE
 │       ├── envs.py            # Gym environment utilities
-│       └── train.py           # CLI entry point
+│       ├── train.py           # Training CLI entry point
+│       ├── bench_delayedcue.py # Benchmark harness (DelayedCue)
+│       └── validation.py      # Validation harness / report
 ├── vendor/
 │   └── mamba_ssm/             # Vendored Mamba2 library
 ├── scripts/
@@ -54,6 +56,7 @@ INFINITY_DUAL_HYBRID_LEAN/
 ├── tests/
 │   ├── test_dual_tier_miras_cartpole.py
 │   └── test_memory_sanity.py
+│   └── test_v2_smoke.py
 └── legacy/                    # Archived monolithic versions
 ```
 
@@ -63,10 +66,13 @@ INFINITY_DUAL_HYBRID_LEAN/
 cd INFINITY_DUAL_HYBRID_LEAN
 
 # Recommended (editable install)
-pip install -e .
+python3 -m pip install -e .
 
 # Dev tools (tests/formatting)
-pip install -e ".[dev]"
+python3 -m pip install -e ".[dev]"
+
+# Optional extras (FAISS, TensorBoard, Mamba2)
+python3 -m pip install -e ".[all]"
 ```
 
 ## Quick Start
@@ -78,19 +84,40 @@ pip install -e ".[dev]"
 cd INFINITY_DUAL_HYBRID_LEAN
 
 # Quick sanity test
-python -m infinity_dual_hybrid.train --test
+python3 -m infinity_dual_hybrid.train --test
 
 # Full training via console script
-infinity-train --env CartPole-v1 --iterations 50
+infinity-train --env CartPole-v1 --iterations 50 --seed 123
 
 # Train baseline (no memory)
-python scripts/train_cartpole_baseline.py
+python3 scripts/train_cartpole_baseline.py
 
 # Train with Miras memory
-python scripts/train_cartpole_miras.py
+python3 scripts/train_cartpole_miras.py
 
 # Run auto-tuner
-python scripts/auto_tuner_dual_hybrid.py
+python3 scripts/auto_tuner_dual_hybrid.py
+```
+
+### Outputs (reproducible run folders)
+
+Training writes a self-contained run folder:
+
+```text
+results/<run_name>/<timestamp>/
+  config.json
+  metrics.json
+  metrics.csv
+  metrics.jsonl
+  run_commands.sh
+  checkpoints/
+```
+
+Benchmarks and validation follow the same pattern:
+
+```text
+results/bench_delayedcue/<timestamp>/
+results/validation/<timestamp>/
 ```
 
 ### Python API
@@ -161,7 +188,7 @@ cfg.agent.sync_dims()  # Call after changing hidden_dim
 ```bash
 # Run tests
 cd INFINITY_DUAL_HYBRID_LEAN
-python -m pytest tests/ -v
+python3 -m pytest -q
 ```
 
 ## Memory Systems

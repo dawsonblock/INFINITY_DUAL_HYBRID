@@ -87,7 +87,7 @@ class DelayedCueEnv(gym.Env):
             float(self.episode_len),
             1.0,
         )
-        noise = float(np.random.randn() * self.noise_std)
+        noise = float(self.np_random.normal() * self.noise_std)
 
         obs = np.array(
             [cue_bit, t_norm, ts_norm, target_time_norm, noise],

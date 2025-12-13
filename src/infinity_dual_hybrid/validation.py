@@ -52,6 +52,11 @@ def _set_seeds(seed: int) -> Dict[str, int]:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except Exception:
+        pass
     return {
         "random": seed,
         "numpy": seed,
@@ -313,7 +318,15 @@ def _nan_inf_grad_check(
 ) -> Dict[str, Any]:
     envs = make_envs(env_id, num_envs=1, cfg=cfg)
     agent = InfinityV3DualHybridAgent(cfg.agent).to(device)
-    trainer = PPOTrainer(agent, cfg.ppo, device=device)
+    seed = getattr(cfg, "seed", None)
+    if seed is not None:
+        _set_seeds(int(seed))
+    trainer = PPOTrainer(
+        agent,
+        cfg.ppo,
+        device=device,
+        seed=seed,
+    )
 
     rollouts = trainer.collect_rollouts(envs)
 
@@ -415,9 +428,10 @@ def _one_update_gate_metrics(
     device: str,
     out_dir: str,
 ) -> Dict[str, Any]:
+    _set_seeds(int(seed))
     envs = make_envs(env_id, num_envs=1, cfg=cfg)
     agent = InfinityV3DualHybridAgent(cfg.agent).to(device)
-    trainer = PPOTrainer(agent, cfg.ppo, device=device)
+    trainer = PPOTrainer(agent, cfg.ppo, device=device, seed=int(seed))
 
     rollouts = trainer.collect_rollouts(envs)
 
@@ -509,8 +523,12 @@ def _eval_policy_success(
 
     agent.eval()
 
-    for _ in range(episodes):
-        reset_out = env.reset(seed=int(getattr(cfg, "seed", 0)))
+    base_seed = getattr(cfg, "seed", None)
+    for ep in range(episodes):
+        if base_seed is None:
+            reset_out = env.reset()
+        else:
+            reset_out = env.reset(seed=int(base_seed) + int(ep))
         obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
 
         done = False
@@ -570,9 +588,13 @@ def _train_run(
     cfg.ppo.max_iterations = iterations
     cfg.ppo.num_envs = 1
 
+    seed = getattr(cfg, "seed", None)
+    if seed is not None:
+        _set_seeds(int(seed))
+
     envs = make_envs(env_id, num_envs=1, cfg=cfg)
     agent = InfinityV3DualHybridAgent(cfg.agent).to(device)
-    trainer = PPOTrainer(agent, cfg.ppo, device=device)
+    trainer = PPOTrainer(agent, cfg.ppo, device=device, seed=seed)
 
     hist: Dict[str, List[float]] = {
         "mean_reward": [],
@@ -615,7 +637,7 @@ def _write_run_commands(
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         "",
-        "PYTHONPATH=src python -m infinity_dual_hybrid.validation \\",
+        "PYTHONPATH=src python3 -m infinity_dual_hybrid.validation \\",
         f"  --out {out_dir} \\",
         f"  --seed {args.seed} \\",
         f"  --device {args.device} \\",
@@ -647,8 +669,16 @@ def main() -> None:
     args = parser.parse_args()
 
     tag = _now_tag()
-    out_dir = args.out or os.path.join("results", f"validation_{tag}")
+    out_dir = args.out or os.path.join("results", "validation", tag)
     _ensure_dir(out_dir)
+
+    _write_json(
+        os.path.join(out_dir, "config.json"),
+        {
+            **vars(args),
+            "out_dir": out_dir,
+        },
+    )
 
     log_path = os.path.join(out_dir, "validation.log")
     log_f = open(log_path, "w", encoding="utf-8")

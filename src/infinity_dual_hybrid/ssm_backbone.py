@@ -35,6 +35,13 @@ except ImportError:
     HAS_MAMBA = False
 
 
+def detect_ssm_backend(cfg: BackboneConfig) -> str:
+    use_mamba = bool(getattr(cfg, "use_mamba", False))
+    if use_mamba and HAS_MAMBA:
+        return "mamba2"
+    return "fallback"
+
+
 class DropPath(nn.Module):
     """
     Stochastic Depth (DropPath) for regularization.
@@ -224,6 +231,19 @@ class HybridSSMAttentionBackbone(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.d_model = cfg.d_model
+
+        require_mamba2 = bool(getattr(cfg, "require_mamba2", False))
+        if require_mamba2 and not bool(getattr(cfg, "use_mamba", False)):
+            raise ValueError(
+                "require_mamba2=True requires use_mamba=True. "
+                "Set BackboneConfig.use_mamba=True or disable require_mamba2."
+            )
+        if require_mamba2 and not HAS_MAMBA:
+            raise RuntimeError(
+                "require_mamba2=True but Mamba2 is not available. "
+                "Install mamba-ssm and its Triton/CUDA dependencies, "
+                "or set require_mamba2=False to allow fallback."
+            )
 
         # Determine what's available
         use_mamba = cfg.use_mamba and HAS_MAMBA

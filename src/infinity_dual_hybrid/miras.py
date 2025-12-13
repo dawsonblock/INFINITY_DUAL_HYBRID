@@ -4,8 +4,10 @@ miras.py
 Dual-Tier Miras Parametric Memory System.
 
 Architecture:
-- Fast Tier (SSMCompressedMiras): SGD-based low-rank memory for rapid adaptation
-- Deep Tier (SSMCompressedMirasTitans): Momentum-based with Huber loss and retention gate
+- Fast Tier (SSMCompressedMiras): SGD-based low-rank memory for rapid
+  adaptation
+- Deep Tier (SSMCompressedMirasTitans): Momentum-based with Huber loss and
+  retention gate
 - DualTierMiras: Combines both tiers with context-gated mixing
 
 The two tiers serve different purposes:
@@ -46,6 +48,7 @@ class SSMCompressedMirasTitans(nn.Module):
         rank: int = 32,
         lr: float = 5e-4,
         l2_reg: float = 1e-4,
+        norm_reg: float = 0.0,
         momentum: float = 0.9,
         use_huber: bool = True,
         huber_delta: float = 1.0,
@@ -59,6 +62,7 @@ class SSMCompressedMirasTitans(nn.Module):
         self.rank = rank
         self.lr = lr
         self.l2_reg = l2_reg
+        self.norm_reg = norm_reg
         self.momentum = momentum
         self.use_huber = use_huber
         self.huber_delta = huber_delta
@@ -76,7 +80,10 @@ class SSMCompressedMirasTitans(nn.Module):
         nn.init.zeros_(self.D)
 
         # Scale for tanh output
-        self.register_buffer("scale", torch.tensor(init_scale, dtype=torch.float32))
+        self.register_buffer(
+            "scale",
+            torch.tensor(init_scale, dtype=torch.float32),
+        )
 
         # Momentum buffers
         self.register_buffer("S_B", torch.zeros_like(self.B))
@@ -97,7 +104,13 @@ class SSMCompressedMirasTitans(nn.Module):
 
     def W(self) -> torch.Tensor:
         """Compute full weight matrix from low-rank factors."""
-        low_rank = self.B @ self.C.t()
+        B = self.B
+        C = self.C
+        if self.use_ema and hasattr(self, "ema_B") and hasattr(self, "ema_C"):
+            B = self.ema_B
+            C = self.ema_C
+
+        low_rank = B @ C.t()
         W = self.scale * torch.tanh(low_rank)
         W = W + torch.diag(self.D)
         return W
@@ -140,7 +153,9 @@ class SSMCompressedMirasTitans(nn.Module):
         batch_size = k.shape[0]
 
         # Compute reconstruction error
-        W = self.W()
+        low_rank = self.B @ self.C.t()
+        W = self.scale * torch.tanh(low_rank)
+        W = W + torch.diag(self.D)
         v_hat = k @ W.t()
         err = v - v_hat
 
@@ -161,6 +176,10 @@ class SSMCompressedMirasTitans(nn.Module):
         gradW = -(err.t() @ k) / (batch_size + 1e-8) + self.l2_reg * W
         gradB = gradW @ self.C
         gradC = gradW.t() @ self.B
+
+        if self.norm_reg > 0:
+            gradB = gradB + self.norm_reg * self.B
+            gradC = gradC + self.norm_reg * self.C
 
         # Gradient clipping
         if self.grad_clip > 0:
@@ -185,18 +204,41 @@ class SSMCompressedMirasTitans(nn.Module):
 
         # EMA update of shadow parameters
         if self.use_ema:
-            self.ema_B = self.ema_decay * self.ema_B + (1 - self.ema_decay) * self.B.data
-            self.ema_C = self.ema_decay * self.ema_C + (1 - self.ema_decay) * self.C.data
+            self.ema_B = (
+                self.ema_decay * self.ema_B
+                + (1 - self.ema_decay) * self.B.data
+            )
+            self.ema_C = (
+                self.ema_decay * self.ema_C
+                + (1 - self.ema_decay) * self.C.data
+            )
+
+        b_norm = float(self.B.data.norm().item())
+        c_norm = float(self.C.data.norm().item())
+        err_l2 = float(err.norm(dim=-1).mean().item())
+        retention = (
+            float(alpha_t.mean().item())
+            if alpha_t.dim() > 0
+            else float(alpha_t.item())
+        )
+
+        if not (
+            math.isfinite(b_norm)
+            and math.isfinite(c_norm)
+            and math.isfinite(err_l2)
+            and math.isfinite(retention)
+        ):
+            raise FloatingPointError("Non-finite MIRAS deep-tier update")
 
         stats = {
-            "B_norm": float(self.B.data.norm().item()),
-            "C_norm": float(self.C.data.norm().item()),
+            "B_norm": b_norm,
+            "C_norm": c_norm,
             "S_B_norm": float(self.S_B.norm().item()),
             "S_C_norm": float(self.S_C.norm().item()),
             "gradB_norm": float(gradB.norm().item()),
             "gradC_norm": float(gradC.norm().item()),
-            "retention": float(alpha_t.mean().item()) if alpha_t.dim() > 0 else float(alpha_t.item()),
-            "err_l2": float(err.norm(dim=-1).mean().item()),
+            "retention": retention,
+            "err_l2": err_l2,
         }
         return stats
 
@@ -231,6 +273,7 @@ class SSMCompressedMiras(nn.Module):
         rank: int = 32,
         lr: float = 1e-3,
         l2_reg: float = 1e-4,
+        norm_reg: float = 0.0,
         init_scale: float = 0.1,
         grad_clip: float = 1.0,
     ):
@@ -239,6 +282,7 @@ class SSMCompressedMiras(nn.Module):
         self.rank = rank
         self.lr = lr
         self.l2_reg = l2_reg
+        self.norm_reg = norm_reg
         self.grad_clip = grad_clip
 
         # Low-rank factors
@@ -250,7 +294,10 @@ class SSMCompressedMiras(nn.Module):
         nn.init.xavier_uniform_(self.C)
         nn.init.zeros_(self.D)
 
-        self.register_buffer("scale", torch.tensor(init_scale, dtype=torch.float32))
+        self.register_buffer(
+            "scale",
+            torch.tensor(init_scale, dtype=torch.float32),
+        )
 
     def W(self) -> torch.Tensor:
         """Compute full weight matrix from low-rank factors."""
@@ -295,6 +342,10 @@ class SSMCompressedMiras(nn.Module):
         gradB = gradW @ self.C
         gradC = gradW.t() @ self.B
 
+        if self.norm_reg > 0:
+            gradB = gradB + self.norm_reg * self.B
+            gradC = gradC + self.norm_reg * self.C
+
         # Gradient clipping
         if self.grad_clip > 0:
             gradB_norm = gradB.norm()
@@ -308,10 +359,20 @@ class SSMCompressedMiras(nn.Module):
         self.B.data.add_(-self.lr * gradB)
         self.C.data.add_(-self.lr * gradC)
 
+        b_norm = float(self.B.data.norm().item())
+        c_norm = float(self.C.data.norm().item())
+        err_l2 = float(err.norm(dim=-1).mean().item())
+        if not (
+            math.isfinite(b_norm)
+            and math.isfinite(c_norm)
+            and math.isfinite(err_l2)
+        ):
+            raise FloatingPointError("Non-finite MIRAS fast-tier update")
+
         return {
-            "B_norm": float(self.B.data.norm().item()),
-            "C_norm": float(self.C.data.norm().item()),
-            "err_l2": float(err.norm(dim=-1).mean().item()),
+            "B_norm": b_norm,
+            "C_norm": c_norm,
+            "err_l2": err_l2,
         }
 
     def reset_state(self) -> None:
@@ -344,30 +405,59 @@ class DualTierMiras(nn.Module):
         fast_rank: int = 32,
         deep_rank: int = 32,
         fast_lr: float = 1e-3,
+        fast_l2_reg: float = 1e-4,
+        fast_init_scale: float = 0.1,
         deep_lr: float = 5e-4,
+        deep_l2_reg: float = 1e-4,
+        deep_momentum: float = 0.9,
+        deep_use_huber: bool = True,
+        deep_huber_delta: float = 1.0,
+        deep_init_scale: float = 0.1,
         init_fast_weight: float = 0.7,
         context_gate: bool = True,
+        grad_clip: float = 1.0,
+        norm_reg: float = 0.0,
+        use_ema: bool = False,
+        ema_decay: float = 0.99,
     ):
         super().__init__()
         self.d_model = d_model
         self.context_gate_enabled = context_gate
         self.init_fast_weight = init_fast_weight
+        self._last_update_stats: Dict[str, float] = {}
 
         # Create fast and deep tiers
         self.fast_mem = SSMCompressedMiras(
             d_model=d_model,
             rank=fast_rank,
             lr=fast_lr,
+            l2_reg=fast_l2_reg,
+            norm_reg=norm_reg,
+            init_scale=fast_init_scale,
+            grad_clip=grad_clip,
         )
         self.deep_mem = SSMCompressedMirasTitans(
             d_model=d_model,
             rank=deep_rank,
             lr=deep_lr,
+            l2_reg=deep_l2_reg,
+            norm_reg=norm_reg,
+            momentum=deep_momentum,
+            use_huber=deep_use_huber,
+            huber_delta=deep_huber_delta,
+            init_scale=deep_init_scale,
+            grad_clip=grad_clip,
+            use_ema=use_ema,
+            ema_decay=ema_decay,
         )
 
         # Learnable mixing logit (initialized to achieve init_fast_weight)
-        init_logit = math.log(init_fast_weight / (1.0 - init_fast_weight + 1e-8))
-        self.mix_logit = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
+        init_logit = math.log(
+            init_fast_weight / (1.0 - init_fast_weight + 1e-8)
+        )
+        self.mix_logit = nn.Parameter(
+            torch.tensor(init_logit, dtype=torch.float32)
+        )
 
         # Context-dependent gate
         if context_gate:
@@ -388,12 +478,26 @@ class DualTierMiras(nn.Module):
             fast_rank=cfg.fast_rank,
             deep_rank=cfg.deep_rank,
             fast_lr=cfg.fast_lr,
+            fast_l2_reg=cfg.fast_l2_reg,
+            fast_init_scale=cfg.fast_init_scale,
             deep_lr=cfg.deep_lr,
+            deep_l2_reg=cfg.deep_l2_reg,
+            deep_momentum=cfg.deep_momentum,
+            deep_use_huber=cfg.deep_use_huber,
+            deep_huber_delta=cfg.deep_huber_delta,
+            deep_init_scale=cfg.deep_init_scale,
             init_fast_weight=cfg.init_fast_weight,
             context_gate=cfg.context_gate,
+            grad_clip=cfg.grad_clip,
+            norm_reg=cfg.norm_reg,
+            use_ema=cfg.use_ema,
+            ema_decay=cfg.ema_decay,
         )
 
-    def compute_mix(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def compute_mix(
+        self,
+        context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute mixing weight for fast tier."""
         base = torch.sigmoid(self.mix_logit)
         if self.mix_gate is None or context is None:
@@ -480,6 +584,8 @@ class DualTierMiras(nn.Module):
         stats["mix/deep_weight"] = 1.0 - w_mean
         stats["mix/logit"] = float(self.mix_logit.data.item())
 
+        self._last_update_stats = dict(stats)
+
         return stats
 
     def reset_state(self) -> None:
@@ -488,7 +594,8 @@ class DualTierMiras(nn.Module):
         self.deep_mem.reset_state()
 
     def reset(self) -> None:
-        """Alias for reset_state() - resets memory without resetting learned params."""
+        """Alias for reset_state() - resets memory without resetting learned
+        params."""
         self.reset_state()
 
     def get_stats(self) -> Dict[str, float]:
@@ -499,7 +606,7 @@ class DualTierMiras(nn.Module):
         else:
             mix_ratio = float(w_fast.item())
 
-        return {
+        out = {
             "fast_B_norm": float(self.fast_mem.B.data.norm().item()),
             "fast_C_norm": float(self.fast_mem.C.data.norm().item()),
             "deep_B_norm": float(self.deep_mem.B.data.norm().item()),
@@ -508,19 +615,42 @@ class DualTierMiras(nn.Module):
             "mix_logit": float(self.mix_logit.data.item()),
         }
 
+        last = getattr(self, "_last_update_stats", None)
+        if isinstance(last, dict):
+            pairs = {
+                "fast/err_l2": "fast_err_l2",
+                "deep/err_l2": "deep_err_l2",
+                "deep/retention": "deep_retention",
+                "deep/gradB_norm": "deep_gradB_norm",
+                "deep/gradC_norm": "deep_gradC_norm",
+            }
+            for src, dst in pairs.items():
+                v = last.get(src)
+                if v is not None:
+                    out[dst] = float(v)
+
+        return out
+
     def reset_parameters(self) -> None:
         """Full parameter reset."""
         self.fast_mem.reset_parameters()
         self.deep_mem.reset_parameters()
 
-        init_logit = math.log(self.init_fast_weight / (1.0 - self.init_fast_weight + 1e-8))
-        self.mix_logit.data.copy_(torch.tensor(init_logit, dtype=torch.float32))
+        init_logit = math.log(
+            self.init_fast_weight
+            / (1.0 - self.init_fast_weight + 1e-8)
+        )
+        self.mix_logit.data.copy_(
+            torch.tensor(init_logit, dtype=torch.float32)
+        )
 
         if self.mix_gate is not None:
             for m in self.mix_gate.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.kaiming_uniform_(m.weight)
                     if m.bias is not None:
-                        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(
+                            m.weight
+                        )
                         bound = 1 / math.sqrt(fan_in)
                         nn.init.uniform_(m.bias, -bound, bound)

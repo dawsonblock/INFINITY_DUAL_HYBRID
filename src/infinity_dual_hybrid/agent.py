@@ -43,6 +43,7 @@ from .ltm import build_ltm, LTMWrapper
 from .ssm_backbone import (
     HybridSSMAttentionBackbone,
     ObservationEncoder,
+    detect_ssm_backend,
 )
 
 
@@ -155,10 +156,9 @@ class InfinityV3DualHybridAgent(nn.Module):
         self.backbone = HybridSSMAttentionBackbone(cfg.backbone)
 
         if cfg.log_mamba_backend:
-            backend = (
-                "Mamba2" if len(self.backbone.mamba_layers) > 0 else "fallback"
-            )
-            print(f"SSM backend: {backend}")
+            backend = detect_ssm_backend(cfg.backbone)
+            backend_str = "Mamba2" if backend == "mamba2" else "fallback"
+            print(f"SSM backend: {backend_str}")
 
         # Dual-Tier Miras
         if cfg.use_miras_in_forward:
@@ -253,6 +253,11 @@ class InfinityV3DualHybridAgent(nn.Module):
                 "deep_B_norm": miras_stats.get("deep_B_norm", 0),
                 "deep_C_norm": miras_stats.get("deep_C_norm", 0),
                 "mix_ratio": miras_stats.get("mix_ratio", 0),
+                "fast_err_l2": miras_stats.get("fast_err_l2"),
+                "deep_err_l2": miras_stats.get("deep_err_l2"),
+                "deep_retention": miras_stats.get("deep_retention"),
+                "deep_gradB_norm": miras_stats.get("deep_gradB_norm"),
+                "deep_gradC_norm": miras_stats.get("deep_gradC_norm"),
             }
         else:
             state["miras"] = None

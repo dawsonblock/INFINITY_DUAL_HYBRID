@@ -75,6 +75,7 @@ class BackboneConfig:
 
     # SSM (Mamba2) settings
     use_mamba: bool = True
+    require_mamba2: bool = False
     mamba_d_state: int = 64
     mamba_d_conv: int = 4
     mamba_expand: int = 2
