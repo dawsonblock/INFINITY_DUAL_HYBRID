@@ -131,20 +131,30 @@ def train(
 
     if cfg.env_register_local:
         try:
-            register(
-                id="DelayedCue-v0",
-                entry_point="infinity_dual_hybrid.envs:DelayedCueEnv",
-            )
+            from gymnasium.envs.registration import registry as gym_registry
         except Exception:
-            pass
+            gym_registry = None
 
-        try:
-            register(
-                id="DelayedCueRegime-v0",
-                entry_point="infinity_dual_hybrid.envs:DelayedCueRegimeEnv",
-            )
-        except Exception:
-            pass
+        if gym_registry is None or "DelayedCue-v0" not in gym_registry:
+            try:
+                register(
+                    id="DelayedCue-v0",
+                    entry_point="infinity_dual_hybrid.envs:DelayedCueEnv",
+                )
+            except Exception:
+                pass
+
+        if (
+            gym_registry is None
+            or "DelayedCueRegime-v0" not in gym_registry
+        ):
+            try:
+                register(
+                    id="DelayedCueRegime-v0",
+                    entry_point="infinity_dual_hybrid.envs:DelayedCueRegimeEnv",
+                )
+            except Exception:
+                pass
 
     # Set seed
     set_seed(cfg.seed)

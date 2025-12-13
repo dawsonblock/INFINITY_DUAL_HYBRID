@@ -96,23 +96,25 @@ def _runtime_info() -> Dict[str, Any]:
 
 def _register_local_envs() -> None:
     try:
-        from gymnasium.envs.registration import register
+        from gymnasium.envs.registration import register, registry
 
-        try:
-            register(
-                id="DelayedCue-v0",
-                entry_point="infinity_dual_hybrid.envs:DelayedCueEnv",
-            )
-        except Exception:
-            pass
+        if "DelayedCue-v0" not in registry:
+            try:
+                register(
+                    id="DelayedCue-v0",
+                    entry_point="infinity_dual_hybrid.envs:DelayedCueEnv",
+                )
+            except Exception:
+                pass
 
-        try:
-            register(
-                id="DelayedCueRegime-v0",
-                entry_point="infinity_dual_hybrid.envs:DelayedCueRegimeEnv",
-            )
-        except Exception:
-            pass
+        if "DelayedCueRegime-v0" not in registry:
+            try:
+                register(
+                    id="DelayedCueRegime-v0",
+                    entry_point="infinity_dual_hybrid.envs:DelayedCueRegimeEnv",
+                )
+            except Exception:
+                pass
     except Exception:
         return
 
