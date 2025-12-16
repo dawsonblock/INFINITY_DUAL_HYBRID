@@ -18,12 +18,22 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from datetime import datetime
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
+SummaryWriter = None
+HAS_TENSORBOARD = False
+
+
+def _try_import_summary_writer() -> None:
+    global SummaryWriter, HAS_TENSORBOARD
+    if HAS_TENSORBOARD and SummaryWriter is not None:
+        return
+    try:
+        from torch.utils.tensorboard import SummaryWriter as _SummaryWriter
+    except Exception:
+        SummaryWriter = None
+        HAS_TENSORBOARD = False
+        return
+    SummaryWriter = _SummaryWriter
     HAS_TENSORBOARD = True
-except ImportError:
-    SummaryWriter = None
-    HAS_TENSORBOARD = False
 
 
 @dataclass
@@ -72,8 +82,10 @@ class UnifiedLogger:
         if cfg.use_jsonl:
             self._init_jsonl()
 
-        if cfg.use_tensorboard and HAS_TENSORBOARD:
-            self._init_tensorboard()
+        if cfg.use_tensorboard:
+            _try_import_summary_writer()
+            if HAS_TENSORBOARD:
+                self._init_tensorboard()
 
     def _init_csv(self) -> None:
         """Initialize CSV logger."""
@@ -87,6 +99,7 @@ class UnifiedLogger:
 
     def _init_tensorboard(self) -> None:
         """Initialize TensorBoard logger."""
+        _try_import_summary_writer()
         if HAS_TENSORBOARD:
             tb_path = self.log_path / "tensorboard"
             self._tb_writer = SummaryWriter(log_dir=str(tb_path))
@@ -183,8 +196,10 @@ class UnifiedLogger:
         parts = [f"[{step:6d}]"]
 
         # Add common metrics if present
-        if "mean_reward" in metrics:
-            parts.append(f"reward={metrics['mean_reward']:.2f}")
+        if "mean_step_reward" in metrics:
+            parts.append(f"step_rew={metrics['mean_step_reward']:.2f}")
+        elif "mean_reward" in metrics:
+            parts.append(f"step_rew={metrics['mean_reward']:.2f}")
         if "mean_return" in metrics:
             parts.append(f"return={metrics['mean_return']:.2f}")
         if "policy_loss" in metrics:

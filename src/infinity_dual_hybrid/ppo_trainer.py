@@ -481,6 +481,8 @@ class PPOTrainer:
 
         self.iteration += 1
 
+        mean_step_reward = rollouts.rewards.mean().item()
+
         return {
             "policy_loss": total_policy_loss / num_updates,
             "value_loss": total_value_loss / num_updates,
@@ -498,7 +500,8 @@ class PPOTrainer:
             "effective_write_mean": total_effective_write / num_updates,
             "learning_rate": self.current_lr,
             "kl_coef": self.kl_coef,
-            "mean_reward": rollouts.rewards.mean().item(),
+            "mean_reward": mean_step_reward,
+            "mean_step_reward": mean_step_reward,
             "mean_return": rollouts.returns.mean().item(),
             "mean_advantage": rollouts.advantages.mean().item(),
         }

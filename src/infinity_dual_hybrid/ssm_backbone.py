@@ -17,6 +17,8 @@ For RL, we also provide a simple MLP backbone for non-sequential observations.
 """
 
 from typing import Optional, Tuple, Any
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -28,11 +30,24 @@ HAS_MAMBA = False
 Mamba2 = None
 
 try:
-    from mamba_ssm.modules.mamba2 import Mamba2
+    from mamba_ssm.modules.mamba2 import Mamba2 as _Mamba2
+except Exception:
+    _Mamba2 = None
+
+if _Mamba2 is None:
+    try:
+        _vendor_dir = Path(__file__).resolve().parents[2] / "vendor"
+        if (_vendor_dir / "mamba_ssm").is_dir():
+            _vendor_str = str(_vendor_dir)
+            if _vendor_str not in sys.path:
+                sys.path.insert(0, _vendor_str)
+            from mamba_ssm.modules.mamba2 import Mamba2 as _Mamba2
+    except Exception:
+        _Mamba2 = None
+
+if _Mamba2 is not None:
+    Mamba2 = _Mamba2
     HAS_MAMBA = True
-except ImportError:
-    Mamba2 = None
-    HAS_MAMBA = False
 
 
 def detect_ssm_backend(cfg: BackboneConfig) -> str:

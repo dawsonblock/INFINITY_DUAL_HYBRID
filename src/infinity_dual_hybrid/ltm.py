@@ -17,6 +17,7 @@ Usage:
 import threading
 from queue import Queue
 from typing import Optional
+import warnings
 
 import torch
 import torch.nn as nn
@@ -35,7 +36,9 @@ def _try_import_faiss() -> None:
     if HAS_FAISS or _FAISS_IMPORT_ERROR is not None:
         return
     try:
-        import faiss as _faiss  # type: ignore
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            import faiss as _faiss  # type: ignore
     except Exception as e:
         faiss = None
         HAS_FAISS = False

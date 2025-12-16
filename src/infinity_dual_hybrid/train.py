@@ -291,7 +291,7 @@ def train(
                     f"policy_loss={train_stats['policy_loss']:.4f} "
                     f"value_loss={train_stats['value_loss']:.4f} "
                     f"entropy={train_stats['entropy']:.4f} "
-                    f"mean_rew={train_stats['mean_reward']:.2f}"
+                    f"mean_step_rew={train_stats['mean_step_reward']:.2f}"
                 )
                 if eval_stats:
                     log_str += f" | eval={eval_stats['eval_mean_reward']:.2f}"
